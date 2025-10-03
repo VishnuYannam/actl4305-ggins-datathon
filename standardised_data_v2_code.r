@@ -12,6 +12,7 @@ df <- original %>%
 
 df[df$trip_start_date > df$trip_end_date, ]
 
+# quote date + time format, trip length/lead length, ages of travelers, traveler groups, 
 df <- df %>%
   mutate(
     quote_create_time = ydm_hms(quote_create_time),
@@ -62,8 +63,10 @@ df <- df %>%
   ) %>%
   ungroup()
 
+# initialise boost number column
 df$boost_num <- NA_integer_
 
+# loop to count boost number
 for (i in 1:nrow(df)) {
   boost_num <- 0
   for (j in 1:8) {
@@ -83,7 +86,7 @@ df <- df %>%
                    map(~ str_squish(tolower(.x))))
   )
 
-
+# named list/dictionary
 region_map <- list(
   "Africa" = c(
     "All of Africa","South Africa","Egypt","Kenya","Morocco","Namibia","Tanzania",
@@ -140,6 +143,7 @@ region_map <- list(
     "Alberta","British Columbia",
     "Mexico","Mexico City","Cancun"
   ),
+  
   "Central_America" = c(
     "Puerto Rico","Bahamas","Barbados","Dominican Rep.","Cayman Islands","Jamaica",
     "Bermuda","Guadeloupe","Martinique","Aruba","Anguilla","Antigua and Barbuda",
@@ -147,6 +151,7 @@ region_map <- list(
     "Panama","Panama City","Costa Rica","Nicaragua","Honduras","Guatemala","Belize",
     "El Salvador","Salvador","Netherlands Antilles","Dominica","Haiti"
   ),
+  
   "South_America" = c(
     "All of South America","Brazil","Rio de Janeiro","Argentina","Buenos Aires","Chile","Santiago",
     "Peru","Lima","Ecuador","Colombia","Uruguay","Paraguay","Bolivia","Venezuela",
@@ -189,17 +194,20 @@ region_map <- list(
   "Antarctica" = c("Antarctica","Antarctica (Cruising)","Antarctica-Sightseeing Flight")
 )
 
-# again str squish
+# lapply --> always return a list, apply function to every element of list. sapply --> wrapper around lapply to try and simplify
+# things if, e.g. every element is a number, then return a vector not a list.
 region_map_lower <- lapply(region_map, function(x) tolower(str_squish(x)))
 
 domestic_cruise_regex <- "domestic\\s*cruise"
 cruise_regex <- "cruise"
 
-# grepl is logical grep, grep = shell command to search within something (here it is a list) for a certain regex match
+# grepl is logical grep, grep = command originating from shell used to search within something
+# (here it is a list) for a certain regex match
 df <- df %>%
   mutate(
     Domestic_Cruise = as.integer(
       # apply function onto every element of dest_list and creates a new list, of booleans since we are running the any() function
+      # converted to integer for one hot encoding
       sapply(dest_list, function(x)
         any(grepl(domestic_cruise_regex, x, ignore.case = TRUE))
       )
@@ -221,13 +229,16 @@ for (name in names(region_map_lower)) {
   df[[name]] <- sapply(df$dest_list, function(dest) as.integer(any(dest %in% list)))
 }
 
-flag_cols <- c("Africa","Europe","Oceania","North America","South America",
+# rearranging the continents/regions better.
+flag_cols <- c("Africa","Europe","Oceania","North America", "Central America","South America",
                "Middle East","Central Asia","South East Asia","South Asia","East Asia",
-               "Domestic Cruise","International Cruise","Multi_Region")
+               "Domestic Cruise","International Cruise","Multi Region","Antarctica")
 
+# rearrange column order
 df <- df %>%
   relocate(any_of(flag_cols), .after = dest_list)
 
+# boosts into one hot encoded variables
 df <- df  %>% 
   mutate(
     snowsports = as.integer(if_any(starts_with("boost_"), ~ str_detect(.x, "Snow Sports"))),
@@ -254,6 +265,7 @@ df <- df  %>%
   )
 
 # since we need to compute a summary within each row rather than rely on vectorised whole column operations, need to use rowwise
+# in essence groups up data per row, so each row gets its own operation rather than a vectorised whole column operation
 df <- df %>%
   rowwise() %>%
   mutate(
@@ -261,9 +273,11 @@ df <- df %>%
   ) %>%
   ungroup()
 
+# remove boost name columns since we one hot encoded it above
 df <- df %>%
   select(-matches("^boost_[1-8]_name$"))
 
+# use boost start and end dates to calculate length
 for (i in 1:8) {
   start_col <- paste0("boost_", i, "_start_date")
   end_col   <- paste0("boost_", i, "_end_date")
@@ -275,40 +289,40 @@ for (i in 1:8) {
   df[[len_col]] <- as.numeric(df[[end_col]] - df[[start_col]])
 }
 
+# check to see if any lengths are negative - they shouldn't.
 negative_length_check <- df %>%
   filter(if_any(ends_with("_length"), ~ .x < 0))
 
 
-cols <- c("Africa", "Europe", "Oceania", "North_America", "South_America", 
+cols <- c("Africa", "Europe", "Oceania", "North_America", "Central_America", "South_America", 
           "Middle_East", "Central_Asia", "South_East_Asia", "South_Asia", 
           "East_Asia", "Multi_Region", "Antarctica")
 
+# check to see if any quote does not fall into any region, i.e. error rows.
 region_check <- df %>%
   filter(rowSums(across(all_of(cols))) < 0)
 
-countries <- df %>%
-  mutate(destinations = str_split(destinations, ";\\s*")) %>%
-  pull(destinations) %>%
-  unlist() %>%
+# list of all destinations planned to be visited by every quote - pull extracts a column as a list/vector, unlist flattens
+# it and drops names, then unique gets only non-duplicate locations.
+destination_list <- df %>%
+  pull(dest_list) %>%
+  unlist(use.names = FALSE) %>%
   unique()
+print(destination_list)
 
-print(countries)
+# create a lookup list that by flattening the list in region_map_lower and drops all the names so
+# its JUST the locations, not the regions/continents.
+lookup <- unlist(region_map_lower, use.names = FALSE)
 
-# gsub, grep based substitution that replaces the regex with the other regex
-norm_str <- function(x) {
-  x <- trimws(tolower(x))
-  gsub("\\s+", " ", x)
-}
-
-lookup <- norm_str(unlist(region_map, use.names = FALSE))
-
+# check to see if any country in the destinations list, is not in the lookup list, i.e. the large list of locations that gpt gave
+# for a mapping and was augmented/edited by me to fill in the errors.
+# looking at the results variable I then manually fixed the locations that gpt didn't catch/do properly.
 results <- tibble(
-  country = countries,
-  in_dictionary = norm_str(countries) %in% lookup
+  country = destination_list,
+  in_dictionary = destination_list %in% lookup
 )
 
-print(results)
-
+# function doesn't let me write list based columns so remove for writing into csv
 df_write <- df %>%
   select(-ages, -dest_list)
 
