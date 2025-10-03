@@ -84,8 +84,6 @@ df <- df %>%
   )
 
 
-# region list: Africa, Europe, Oceania, North_America, South_America, Middle_East, Central_Asia, South_East_Asia, South_Asia, East_Asia, Multi_Region
-
 region_map <- list(
   "Africa" = c(
     "All of Africa","South Africa","Egypt","Kenya","Morocco","Namibia","Tanzania",
@@ -197,6 +195,7 @@ region_map_lower <- lapply(region_map, function(x) tolower(str_squish(x)))
 domestic_cruise_regex <- "domestic\\s*cruise"
 cruise_regex <- "cruise"
 
+# grepl is logical grep, grep = shell command to search within something (here it is a list) for a certain regex match
 df <- df %>%
   mutate(
     Domestic_Cruise = as.integer(
@@ -214,7 +213,9 @@ df <- df %>%
     )
   )
 
-
+# loop through all the names of the regon map, i.e. the continents. For each name, extract the list that is part of that continent
+# then for each destination on the dest_list column of the dataframe for each row, check if it is in the list. if it is in, any will
+# return true. as.integer will change to 1, and 1 will be assigned to the new continent column that has just been created in df[[name]]
 for (name in names(region_map_lower)) {
   list <- region_map_lower[[name]]
   df[[name]] <- sapply(df$dest_list, function(dest) as.integer(any(dest %in% list)))
@@ -293,6 +294,7 @@ countries <- df %>%
 
 print(countries)
 
+# gsub, grep based substitution that replaces the regex with the other regex
 norm_str <- function(x) {
   x <- trimws(tolower(x))
   gsub("\\s+", " ", x)
@@ -307,4 +309,7 @@ results <- tibble(
 
 print(results)
 
+df_write <- df %>%
+  select(-ages, -dest_list)
 
+write.csv(df_write,"/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/standardised_freely_quote_data_v2.csv", row.names = FALSE)
