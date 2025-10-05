@@ -82,7 +82,7 @@ for (i in 1:nrow(df)) {
 # map applies the function to all the values of the list provided by str_split
 df <- df %>%
   mutate(
-    dest_list = (str_split(destinations, ";\\s*") %>%
+    dest_list = str_split(destinations, ";\\s*" %>%
                    map(~ str_squish(tolower(.x))))
   )
 
