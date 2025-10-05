@@ -67,7 +67,7 @@ df <- df %>%
 df$boost_num <- NA_integer_
 
 # loop to count boost number
-for (i in 1:nrow(df)) {
+for (i in seq_len(nrow(df))) {
   boost_num <- 0
   for (j in 1:8) {
     name <- paste0("boost_", j, "_name")
@@ -82,8 +82,8 @@ for (i in 1:nrow(df)) {
 # map applies the function to all the values of the list provided by str_split
 df <- df %>%
   mutate(
-    dest_list = str_split(destinations, ";\\s*" %>%
-                   map(~ str_squish(tolower(.x))))
+    dest_list = str_split(destinations, ";\\s*") %>%
+                   map(~ str_squish(tolower(.x)))
   )
 
 # named list/dictionary
