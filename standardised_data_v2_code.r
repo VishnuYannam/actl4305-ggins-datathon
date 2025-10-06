@@ -21,13 +21,14 @@ df <- df %>%
     quote_hour = str_extract(quote_time, "^[0-9]*") %>% as.integer(),
   ) %>%
   mutate(
-    trip_length = trip_end_date - trip_start_date,
+    trip_length = trip_end_date - trip_start_date + 1, # inclusive of start date
     lead_length = trip_start_date - quote_date
   ) %>%
   rowwise %>%
   mutate(
     ages = list(as.numeric(str_split(traveller_ages, ";")[[1]])),
     num_travellers = length(ages),
+    quote_price_per_person_per_day = quote_price / (as.integer(num_travellers) * as.numeric(trip_length)),
     max_age = if (num_travellers) max(ages) else NA_real_,
     min_age = if (num_travellers) min(ages) else NA_real_,
     age_range = if (num_travellers) max_age - min_age else NA_real_,
@@ -62,6 +63,9 @@ df <- df %>%
     )
   ) %>%
   ungroup()
+
+sum(df$trip_start_date < as.Date(df$quote_create_time)) # 844/70000
+sum(df$trip_start_date > df$trip_end_date) # 0
 
 # initialise boost number column
 df$boost_num <- NA_integer_
@@ -261,7 +265,7 @@ df <- df  %>%
     specified_items = if_else(is.na(specified_items), 0, 1)
   ) %>%
   mutate(
-    extra_cancellation = if_else(is.na(extra_cancellation), 0, extra_cancellation)
+    extra_cancellation = if_else(is.na(extra_cancellation), 0, extra_cancellation) # does not require one-hot encoded variable
   )
 
 # since we need to compute a summary within each row rather than rely on vectorised whole column operations, need to use rowwise
@@ -321,6 +325,31 @@ results <- tibble(
   country = destination_list,
   in_dictionary = destination_list %in% lookup
 )
+
+# variable that identifies the discount category
+get_auto_discount <- function(adults) {
+  ifelse(adults == 2, 15,
+         ifelse(adults >= 3, 20, 0))
+}
+
+df <- df %>%
+  mutate(
+    discount_pts = parse_number(discount),        
+    discount_pts = if_else(is.na(discount_pts), 0, discount_pts)
+  ) %>%
+  mutate(
+    auto_discount       = get_auto_discount(num_adults),
+    additional_discount = discount_pts - auto_discount,
+    discount_category   = case_when(
+      discount_pts < 0 ~ "Negative total discount",
+      additional_discount < 0 ~ "Negative additional (auto > total)",
+      discount_pts == 0 ~ "No discount",
+      auto_discount > 0 & additional_discount == 0 ~ "Auto discount only",
+      auto_discount > 0 & additional_discount > 0 ~ "Auto + additional discount",
+      auto_discount == 0 & discount_pts > 0 ~ "Exclusive discount",
+      TRUE ~ "Unknown"
+    )
+  )
 
 # function doesn't let me write list based columns so remove for writing into csv
 df_write <- df %>%
