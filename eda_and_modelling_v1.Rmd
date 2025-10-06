@@ -731,72 +731,6 @@ f1 <- (2 * 1152/(1152 + 1142) * 1152 / (1152 + 7849))/(1152/(1152 + 1142) + 1152
 f1
 ```
 
-```{r}
-X <- model.matrix(convert ~ ., df_tree_modelling)[, -1]
-y <- ifelse(df_tree_modelling$convert == "YES", 1, 0)
-
-set.seed(333)
-train_index <- sample(seq_len(nrow(X)), 0.8 * nrow(X))
-dtrain <- xgb.DMatrix(data = X[train_index, ], label = y[train_index])
-dtest  <- xgb.DMatrix(data = X[-train_index, ], label = y[-train_index])
-
-params <- list(
-  objective = "binary:logistic",
-  eval_metric = "auc",
-  max_depth = 5,
-  eta = 0.1,
-  subsample = 0.8,
-  colsample_bytree = 0.8
-)
-
-xgb_model <- xgb.train(
-  params = params,
-  data = dtrain,
-  nrounds = 200,
-  watchlist = list(train = dtrain, test = dtest),
-  print_every_n = 20,
-  early_stopping_rounds = 20
-)
-
-xgb_pred <- predict(xgb_model, dtest)
-```
-
-grid search stuff
-
-```{r}
-set.seed(444)
-df_tree_modelling$convert <- as.factor(df_tree_modelling$convert)
-
-# CV setup (stratified k-fold)
-ctrl <- trainControl(
-  method = "cv", number = 5,
-  classProbs = TRUE,
-  summaryFunction = twoClassSummary,  # gives ROC
-  savePredictions = "final"
-)
-
-# Candidate grid (tune mtry; can also vary ntree via tuneLength or loop)
-p <- ncol(df_tree_modelling) - 1
-rf_grid <- expand.grid(mtry = unique(pmax(1, round(c(sqrt(p)/2, sqrt(p), 1.5*sqrt(p), 2*sqrt(p))))))
-
-rf_fit <- train(
-  convert ~ ., data = df_tree_modelling,
-  method = "rf",
-  metric = "ROC",
-  trControl = ctrl,
-  tuneGrid = rf_grid,
-  ntree = 500,
-  importance = TRUE
-)
-
-rf_fit
-varImp(rf_fit)
-
-# best model predictions
-rf_pred <- predict(rf_fit, df_tree_modelling, type = "prob")[, 1]
-
-```
-
 ## Imbalanced data processing section
 
 ## Decision Threshold Optimisation
@@ -889,10 +823,6 @@ print(cm_default)
 cat("\nLASSO - Optimized threshold (", opt_lasso$optimal_threshold, "):\n")
 cm_optimized <- evaluate_at_threshold(pred_lasso, y_test, opt_lasso$optimal_threshold)
 print(cm_optimized)
-
-# ridge
-
-# enet
 
 par(mfrow = c(2, 2))
 
