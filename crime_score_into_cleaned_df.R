@@ -352,6 +352,23 @@ na_crime <- crime_joined[is.na(crime_joined$crime_index),]
 na_crime_count <- na_crime %>%
   group_by(indiv_destination) %>%
   summarise(count = n())
+
+crime_joined <- crime_joined %>%
+  mutate(
+    across(where(is.logical), ~ as.numeric(.x))
+  )
+
+df_write <- crime_joined %>%
+  select(quote_id, crime_index) %>%
+  mutate(crime_index = as.character(crime_index)) %>%
+  group_by(quote_id) %>%
+  summarise(
+    crime_index = paste(unique(na.omit(crime_index)), collapse = ", "),
+    .groups = "drop"
+  )
+
+write.csv(df_write,"/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/cleaned_crime_indices.csv", row.names = FALSE)
+
 # 
 # smart_traveller_data <- read_csv('/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/smartraveller_destinations.csv')
 # 
