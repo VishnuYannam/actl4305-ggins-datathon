@@ -1,0 +1,976 @@
+---
+title: "EDA_and_modelling_5oct"
+author: "Michael Wang"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Pre-processing Before EDA
+
+Import Libraries
+
+```{r}
+library(tidyverse)
+```
+
+wd
+
+```{r}
+setwd('/Users/michaelwang/Desktop/unsw/unsw\ actl/4305/Assignment')
+getwd()
+```
+
+Read in the data
+
+```{r}
+df <- read_csv('/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/actl4305-ggins-datathon/standardised_freely_quote_data_v2.csv')
+
+crime_indices <- read_csv('/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/cleaned_crime_indices.csv')
+```
+
+trip main df columns a bit
+
+```{r}
+df_trim <- df %>% 
+  select(-destinations, -traveller_ages, -quote_create_time, -matches("^boost_.*_date$"))
+```
+
+Deal with remaining NA's in the data
+
+```{r}
+df_clean <- df_trim %>%
+  mutate(
+    across(starts_with("boost_"), ~ if_else(is.na(.x), 0, .x)),
+    quote_hour = if_else(quote_hour > 23, 24, quote_hour)
+    )
+
+any(is.na(df_clean))
+```
+
+Glimpse tells us we should turn discount into a number, and then turn the remaining character classes into factors
+
+```{r}
+glimpse(df_clean)
+```
+
+```{r}
+df_discount <- df_clean %>%
+  mutate(
+    discount = as.numeric(str_extract(discount, "^[0-9]*"))
+  )
+
+# gets a names vector, then applies the logical mask to extract only the columns.
+character_colnames <- names(df_discount)[sapply(df_discount, is.character)]
+
+# all_of interprets a character vector as column names
+df_factors <- df_discount %>%
+  mutate(
+    across(all_of(character_colnames), ~ as.factor(.x))
+  )
+```
+
+```{r}
+glimpse(df_factors)
+```
+
+Attach crime scores
+
+```{r}
+df_crime_scores <- df_factors %>%
+  mutate(quote_id = row_number()) %>%
+  left_join(crime_indices, by = "quote_id") %>%
+  select(-quote_id)
+
+df_crime_scores <- df_crime_scores %>%
+  rowwise() %>%
+  mutate(
+    median_crime_index = median(as.numeric(unlist(strsplit(crime_index, ", "))))
+  ) %>%
+  ungroup %>%
+  select(-crime_index)
+```
+
+```{r}
+plot(df_crime_scores$quote_hour)
+```
+
+```{r}
+df_clean_quote_hour <- df_crime_scores %>%
+  mutate(quote_hour = if_else(quote_hour > 23, 24, quote_hour))
+```
+
+```{r}
+table(df_clean_quote_hour$extra_cancellation)
+```
+
+```{r}
+df_extra_cancellation <- df_clean_quote_hour %>%
+  mutate(
+    extra_cancel_tier = case_when(
+      extra_cancellation == 0 ~ 0,
+      extra_cancellation <= 5000 ~ 1,
+      extra_cancellation > 5000 ~ 2,
+      TRUE ~ 1
+    )
+  ) %>%
+    select(-extra_cancellation)
+
+df_final <- df_extra_cancellation %>%
+  select(-quote_time)
+
+```
+
+Backup before eda
+
+```{r}
+df_eda <- df_final
+```
+
+```{r}
+df_write <- df_eda
+write_csv(df_write, '/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/final_eda_modelling_data.csv')
+```
+
+==================================
+
+# EDA
+
+```{r}
+# install.packages("DataExplorer")
+# install.packages("skimr")
+library(DataExplorer)
+library(skimr)
+```
+
+```{r}
+plot_intro(df_eda)
+```
+
+```{r}
+skim(df_eda)
+```
+
+Variables to process outliers first:
+
+-   quote price, lead length, trip length,
+
+Variables to transform first before checking for outliers:
+
+```{r}
+skim_df <- skim(df_eda)
+```
+
+Overall data frame:
+
+1.  median start date: 2024 12 27
+2.  median end date: 2025 01 18
+3.  mean quote price 361, median 201 —\> right skewed with some large outliers (super long trips probably)
+4.  mean quote hour is 14.6, median is 14 very similar. Approx 2pm is best for some reason
+5.  mean trip length is 27 days, median is 15 days. Confirms number 3
+6.  mean lead length is 60 days, median 25
+7.  mean and median 1.8/2 travelers
+8.  mean/median max age 50/51
+9.  mean/median min age 42/39 so high...?
+10. mean age range 8, median 0
+11. mean of mean and median age 26, median is 42/44
+12. mean/median 1.22/1 generation
+13. mean/median 0.5/0 boosts
+14. 0.026 proportion to africa, 0.188 to europe, 0.221 to oceania, 0.028 to multi region, 0.065 domestic cruise, 0.008 international cruise, 0.121 north america, 0.006 central america, 0.017 south america, 0.029 middle east, 0.003 central asia, 0.296 south east asia, 0.034 south asia, 0.147 east asia, 0.002 antarctica (doesn't sum to one since people go to multiple places. Sums to approx 1.191)
+15. 0.1 have kids under 12, 0.069 has teens over 13, 0.75 has adults O 18, 0.3 have seniors O 60, 0.15 is family.
+16. top quote times are around 12pm, 4pm, and 1pm
+17. imbalanced data —\> 60999 NO, 9001 YES
+18. 0.065 have snowsports, 0.009 adventure activities, 0.105 cruise cover, 0.001 medical, 0.033 gadget, 0.025 motorcycle, 0.016 rental vehicle excess, 0.008 specified items.
+19. avg 1.6 adults
+20. mean of median crime index of all visited destinations is 42.44, median 46.1 - slightly right skewed
+21. not sure if boost lengths will tell anything because they represent different things.
+    1.  boost 1: mean length 9 days
+    2.  boost 2: 1.619 days
+    3.  boost 3: 0.366 days
+    4.  boost 4: 0.134 days
+    5.  boost 5: 0.056 days
+    6.  boost 6: 0.027 days
+    7.  boost 7: 0.015 days
+    8.  boost 8: 0.013 days
+22. For each boost length, max value is VERY LARGE. 547, 545, 463, 365, 347, 192, 192, 192
+
+```{r}
+plot_bar(df_eda)
+```
+
+1.  large amount of quotes coming from O60 couples, single U60, single O60, single U30, couple U60, and then parents plus kids. Remaining probably is \< 10000 total quotes.
+2.  most is 15 or 0 discount, makes sense cause thats the auto discount for couple or single as above.
+
+```{r}
+plot_histogram(df_eda)
+```
+
+```{r}
+plot_density(df_eda)
+```
+
+Mean age bimodal at 25 and 60 ish. Num travellers spikes at 1 and 2. Quote hour max at around 14-15. Boost num spikes at 0 and 1. Crime index spikes at approx 48.
+
+Split convert and no convert and visualise
+
+```{r}
+df_eda_convert <- df_eda %>%
+  filter(convert == "YES")
+
+df_eda_nonconvert <- df_eda %>%
+  filter(convert == "NO")
+```
+
+```{r}
+skim(df_eda_convert)
+```
+
+```{r}
+skim_df_convert <- skim(df_eda_convert)
+```
+
+1.  has child 0.117, has teen 0.082, has adult 0.878, has senior 0.1667, is family 0.179
+2.  quote price 193 mean 132 median
+3.  extra cancellation 271 mean 0 median
+4.  quote hour 14.7 mean 15 median.
+5.  trip length 20 days mean 13 days median
+6.  lead length 33.6 mean 10 median
+7.  num travellers 1.8/2 mean/median
+8.  44.8/43 max age mean/median, 35.7/30 min mean/median
+9.  age range mean 9, median 0
+10. mean/median age, mean is 40 median is 34.
+11. 1.2/1 generations mean/median
+12. 0.66/0 boosts mean/median
+13. 0.019 Africa, 0.155 europe, 0.188 oceania, 0.020 multi region, 0.072 domestic cruise, 0.010 international cruise, 0.089 north america, 0.003 central america, 0.013 south america, 0.018 middle east, 0.001 central asia, 0.355 south east asia, 0.026 south asia, 0.202 east asia, 0.001 antarctica
+14. 0.152 snowsports, 0.020 adventure, 0.100 cruise cover, 0.001 medical, 0.084 gadget, 0.069 motorcycle, 0.023 rental vehicle excess, 0.010 specified items
+15. 1.6 mean adults, 1 median
+16. mean median crime index over all locations is 41, median is 46. Max median crime score is 81.
+17. Boost lengths: 5.8, 2.7, 0.7, 0.27, 0.11, 0.03, 0.016, 0.015 mean. Max: 539, 545, 364, 364, 347, 30, 38, 38.
+
+```{r}
+skim(df_eda_nonconvert)
+```
+
+```{r}
+skim_df_nonconvert <- skim(df_eda_nonconvert)
+```
+
+1.  0.1 has child u12, 0.067 has teen o13, 0.73 have adults 018, 0.32 have seniors o65, 0.15 are families
+2.  386 mean quote price, 215 median quote price
+3.  1755 mean extra cancellation, 0 median
+4.  quote hour mean 14.5, median 14
+5.  28 day mean trip length, 16 median
+6.  1.83/2 mean/median travelers
+7.  51/53 max age mean/median
+8.  43/41 min age mean/median
+9.  8/0 age range mean/median
+10. 47/45, 47/46 mean/median of mean age and median age
+11. 1.2/1 mean/median num generations
+12. 0.55/0 mean/median boost number
+13. 0.027 africa, 0.194 europe, 0.226 oceania, 0.029 multi region, 0.064 domestic cruise, 0.008 int cruise, 0.126 north america, 0.006 central america, 0.018 south america, 0.024 middle east, 0.001 central asia, 0.288 south east asia, 0.035 south asia, 0.139 east asia, 0.002 antarctica
+14. 0.052 snow sports, 0.007 adventure, 0.107 cruise cover, 0.0007 medical, 0.025 gadget cover, 0.018 motorcycle, 0.015 rental vehicle excess, 0.008 specific items
+15. 1.6/2 mean/median num adults
+16. boost lengths:
+    1.  9.67, 1.46, 0.312, 0.114, 0.048, 0.027, 0.015, 0.013,
+17. crime score mean 42.65, median 46.1
+
+```{r}
+plot_bar(df_eda_convert)
+```
+
+For converted quotes:
+
+-   mostly single U60 and single U30, then couple U60, couple O60, then single O60, parnets plus kids, couples U30, parents plus teens. everything else is less than 500 out of 9001
+
+```{r}
+plot_bar(df_eda_nonconvert)
+```
+
+For non-converted:
+
+-   mostly couples O60, single O60, single U60, single U30, couple U60, parents plus kids, couple U30. Everything else under 4000 out of 60999
+
+```{r}
+plot_histogram(df_eda_convert)
+```
+
+For converted quotes:
+
+-   mean age is much more centered around 25 as opposed to bimodal in overall data. boost number is larger in general
+
+-   Everything else very similar.
+
+```{r}
+plot_histogram(df_eda_nonconvert)
+```
+
+For non-convert:
+
+-   ages are split better between the two peaks 25 and 60, less boosts overall, longer lead lengths, generally older population.
+
+-   everything else very similar.
+
+```{r}
+plot_density(df_eda_convert)
+```
+
+```{r}
+plot_density(df_eda_nonconvert)
+```
+
+EDA DONE:
+
+-   need to deal with outliers for a few variables to remove possible errors. Winsorize and cap at 99th percentile
+
+    -   quote price, trip length, lead length, boost lengths.
+
+-   box cox for positive non-normal continuous columns, then z score scale them:
+
+    -    all above + age vars +
+
+-   add binary flag if 0's dominate. Otherwise z score scale –\> discrete, count based variables with low ranges
+
+# WINSORISATION
+
+only 200 quotes over 5000, and even less super large ones. 173 trips over a year long. Winsorize/cap at 99th percentile.
+
+```{r}
+df_large_quote_price <- df_eda[df_eda$quote_price > 5000,]
+df_large_lengths <- df_eda[df_eda$trip_length > 365,]
+```
+
+```{r}
+df_capped <- df_eda
+```
+
+```{r}
+cap_trip_len <- quantile(df_capped$trip_length, 0.99)
+df_capped$trip_length_capped <- pmin(df_capped$trip_length, cap_trip_len)
+
+cap_price <- quantile(df_capped$quote_price, 0.99)
+df_capped$quote_price_capped <- pmin(df_capped$quote_price, cap_price)
+
+cap_lead_len <- quantile(df_capped$lead_length, 0.99)
+df_capped$lead_length_capped <- pmin(df_capped$lead_length, cap_lead_len)
+
+boost_cols <- paste0("boost_", 1:8, "_length")
+for (col in boost_cols) {
+  cap_val <- quantile(df_capped[[col]], 0.99)
+  df_capped[[col]] <- pmin(df_capped[[col]], cap_val)
+}
+
+cap_age_range <- quantile(df_capped$age_range, 0.99)
+df_capped$age_range_capped <- pmin(df_capped$age_range, cap_age_range)
+
+df_capped <- df_capped %>%
+  select(-trip_length, -quote_price, -lead_length, -age_range)
+```
+
+# Correlation Analysis
+
+```{r}
+df_correlation <- df_capped %>%
+  select(-median_age, -min_age, -max_age)
+
+cor(df_correlation[ , sapply(df_correlation, is.numeric)])
+```
+
+Main ones over 0.2 or less than -0.2:
+
+discount and num travellers 0.65
+
+boost num and boost 1, 2, 3 (2 \> 3 \> 1) 0.55, 0.5, 0.45
+
+boost num and snow sports 0.33
+
+domestic cruise and oceania 0.49
+
+oceania and south east asia -0.33
+
+boost num and cruise cover 0.41
+
+snow sports and east asia 0.28
+
+boost num and gadget 0.35
+
+crime index and east asia -0.69, and oceania 0.29, africa 0.23
+
+extra cancel teir with discount 0.49, with discount 0.2
+
+trip length capped and europe 0.21
+
+quote price capped and mean age?? 0.33 and north america is 0.32,
+
+lead length capped and mean age 0.35, and europe is 0.21
+
+age range capped and discount 0.41, num travellers 0.8, mean age -0.3, generations 0.79
+
+mean age and domestic cruise 0.2
+
+north america and south east asia -0.22
+
+```{r}
+df_correlation <- df_correlation %>%
+  select(-generations, -age_range_capped, -boost_4_length, -boost_5_length, -boost_6_length, -boost_7_length, -boost_8_length)
+```
+
+```{r}
+df_transformations <- df_correlation
+```
+
+# Box-Cox + z Score Transformations
+
+```{r}
+library(caret)
+```
+
+Box cox all the age related ones, the length related ones and the price.
+
+```{r}
+box_cox_cols <- c(
+  "mean_age",
+  "trip_length_capped",
+  "quote_price_capped",
+  "lead_length_capped",
+  paste0("boost_", 1:3, "_length")
+)
+
+small <- 1e-6
+for (col in box_cox_cols) {
+  zero_flag <- min(df_transformations[[col]])
+  if (zero_flag <= 0) {
+    df_transformations[[col]] <- df_transformations[[col]] + small
+  }
+}
+
+X <- as.data.frame(df_transformations[, box_cox_cols])
+
+preprocess_boxcox <- preProcess(X, method = "BoxCox")
+X_boxcox  <- predict(preprocess_boxcox, X)
+
+df_transformations[paste0(names(X_boxcox), "_boxcox")] <- X_boxcox
+
+boxcox_cols <- paste0(box_cox_cols, "_boxcox")
+X_boxcox <- as.data.frame(df_transformations[, boxcox_cols])
+preprocess_z <- preProcess(X_boxcox, method = c("center", "scale"))
+X_boxcox_z <- predict(preprocess_z, X_boxcox)
+df_transformations[paste0(box_cox_cols, "_boxcox_z")] <- X_boxcox_z
+
+df_transformations <- df_transformations %>%
+  select(-ends_with("_boxcox"), -all_of(box_cox_cols))
+```
+
+```{r}
+df_transformations_1 <- df_transformations
+```
+
+\
+z score transform everything above + all the discrete ones (discount, boost num, num travellers and adults, generations) + crime index
+
+```{r}
+remaining_z_cols <- c(
+  "median_crime_index",
+  "num_adults",
+  "boost_num",
+  "num_travellers",
+  "discount"
+)
+
+small <- 1e-6
+for (col in remaining_z_cols) {
+  zero_flag <- min(df_transformations_1[[col]])
+  if (zero_flag <= 0) {
+    df_transformations_1[[col]] <- df_transformations_1[[col]] + small
+  }
+}
+
+X_z_df <- as.data.frame(df_transformations_1[, remaining_z_cols])
+preprocess_z <- preProcess(X_z_df, method = c("center", "scale"))
+X_z <- predict(preprocess_z, X_z_df)
+df_transformations_1[paste0(remaining_z_cols, "_z")] <- X_z
+
+df_transformations_1 <- df_transformations_1 %>%
+  select(-all_of(remaining_z_cols))
+```
+
+```{r}
+summary(df_transformations_1)
+```
+
+```{r}
+glimpse(df_transformations_1)
+```
+
+# Modelling
+
+```{r}
+# install.packages("xgboost")
+library(glmnet)
+library(randomForest)
+library(xgboost)
+```
+
+Transformed and scaled data for logistic reg + shrinkage
+
+```{r}
+df_modelling <- df_transformations_1
+```
+
+```{r}
+write_csv(df_modelling, '/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/pre_modelling_transformed_data.csv')
+```
+
+## No imbalanced data processing section
+
+### Raw Cross Validation
+
+```{r}
+# model.matrix converts to numeric matrix to run regression, [, -1] removes convert column
+X <- model.matrix(convert ~ ., df_modelling)[, -1]
+y <- ifelse(df_modelling$convert == "YES", 1, 0)
+
+set.seed(111)
+train_index <- sample(seq_len(nrow(X)), 0.8 * nrow(X))
+X_train <- X[train_index, ]
+y_train <- y[train_index]
+X_test  <- X[-train_index, ]
+y_test  <- y[-train_index]
+```
+
+### GLM - Logistic with and without shrinkage (Lasso, Ridge, E-Net)
+
+```{r}
+glm_basic <- glm(convert ~ ., data = df_modelling, family = binomial)
+summary(glm_basic)
+```
+
+```{r}
+# ridge (alpha = 0), lasso (alpha = 1), elastic Net (0 < alpha < 1)
+# then check best one
+cv_lasso  <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 1)
+cv_ridge  <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 0)
+cv_enet   <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 0.5)
+
+cv_lasso$lambda.min
+cv_ridge$lambda.min
+cv_enet$lambda.min
+```
+
+```{r}
+coef_lasso <- coef(cv_lasso, s = "lambda.min")
+coef_ridge <- coef(cv_ridge, s = "lambda.min")
+coef_enet  <- coef(cv_enet,  s = "lambda.min")
+
+coef_lasso
+```
+
+```{r}
+lasso_nonzero <- coef_lasso[coef_lasso[,1] != 0, , drop = FALSE]
+sort(lasso_nonzero[,1], decreasing = TRUE)[1:20]
+
+plot(cv_lasso)
+plot(cv_ridge)
+plot(cv_enet)
+```
+
+```{r}
+ridge_nonzero <- coef_ridge[coef_ridge[,1] != 0, , drop = FALSE]
+sort(ridge_nonzero[,1], decreasing = TRUE)[1:20]
+```
+
+```{r}
+enet_nonzero <- coef_enet[coef_enet[,1] != 0, , drop = FALSE]
+sort(enet_nonzero[,1], decreasing = TRUE)[1:20]
+```
+
+```{r}
+# type = response means to give probabilities for logistic regression
+# predict as a universal apply data to model base r function
+pred_lasso <- predict(cv_lasso, newx = X_test, type = "response", s = "lambda.min")
+pred_ridge <- predict(cv_ridge, newx = X_test, type = "response", s = "lambda.min")
+pred_enet  <- predict(cv_enet,  newx = X_test, type = "response", s = "lambda.min")
+# pred_glm   <- predict(glm_basic, newdata = df_test, type = "response")
+
+# glm_class   <- ifelse(pred_glm   > 0.5, 1, 0)
+lasso_class <- ifelse(pred_lasso > 0.5, 1, 0)
+ridge_class <- ifelse(pred_ridge > 0.5, 1, 0)
+enet_class  <- ifelse(pred_enet  > 0.5, 1, 0)
+
+acc_lasso <- mean(lasso_class == y_test)
+acc_ridge <- mean(ridge_class == y_test)
+acc_enet  <- mean(enet_class  == y_test)
+
+c(Lasso = acc_lasso, Ridge = acc_ridge, ElasticNet = acc_enet)
+```
+
+```{r}
+calculate_metrics <- function(predictions, actual) {
+  tp <- sum(predictions == 1 & actual == 1)
+  tn <- sum(predictions == 0 & actual == 0)
+  fp <- sum(predictions == 1 & actual == 0)
+  fn <- sum(predictions == 0 & actual == 1)
+  
+  accuracy <- (tp + tn) / (tp + tn + fp + fn)
+  
+  precision <- ifelse(tp + fp > 0, tp / (tp + fp), NA)
+  
+  recall <- ifelse(tp + fn > 0, tp / (tp + fn), NA)
+  sensitivity <- recall  # Same as recall
+  
+  specificity <- ifelse(tn + fp > 0, tn / (tn + fp), NA)
+  
+  f1 <- ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+               2 * precision * recall / (precision + recall), NA)
+  
+  balanced_accuracy <- (sensitivity + specificity) / 2
+  
+  return(c(
+    Accuracy = accuracy,
+    Precision = precision,
+    Recall = recall,
+    Specificity = specificity,
+    F1_Score = f1,
+    Balanced_Accuracy = balanced_accuracy
+  ))
+}
+
+metrics_lasso <- calculate_metrics(lasso_class, y_test)
+metrics_ridge <- calculate_metrics(ridge_class, y_test)
+metrics_enet  <- calculate_metrics(enet_class, y_test)
+
+comparison_table <- data.frame(
+  Lasso = metrics_lasso,
+  Ridge = metrics_ridge,
+  ElasticNet = metrics_enet
+)
+
+# Print results
+cat("=" , rep("=", 70), "\n", sep = "")
+cat("MODEL PERFORMANCE COMPARISON (Threshold = 0.5)\n")
+cat("=" , rep("=", 70), "\n", sep = "")
+print(round(comparison_table, 4))
+
+cat("\n\n")
+cat("=" , rep("=", 70), "\n", sep = "")
+cat("DETAILED CONFUSION MATRICES\n")
+cat("=" , rep("=", 70), "\n", sep = "")
+
+cat("\n--- LASSO Model ---\n")
+cm_lasso <- confusionMatrix(
+  factor(lasso_class, levels = c(0, 1)), 
+  factor(y_test, levels = c(0, 1)), 
+  positive = "1"
+)
+print(cm_lasso)
+
+cat("\n--- RIDGE Model ---\n")
+cm_ridge <- confusionMatrix(
+  factor(ridge_class, levels = c(0, 1)), 
+  factor(y_test, levels = c(0, 1)), 
+  positive = "1"
+)
+print(cm_ridge)
+
+cat("\n--- ELASTIC NET Model ---\n")
+cm_enet <- confusionMatrix(
+  factor(enet_class, levels = c(0, 1)), 
+  factor(y_test, levels = c(0, 1)), 
+  positive = "1"
+)
+print(cm_enet)
+```
+
+```{r}
+# install.packages("pROC")
+library(pROC)
+
+roc_lasso <- roc(y_test, as.vector(pred_lasso))
+roc_ridge <- roc(y_test, as.vector(pred_ridge))
+roc_enet  <- roc(y_test, as.vector(pred_enet))
+
+auc(roc_lasso)
+auc(roc_ridge)
+auc(roc_enet)
+```
+
+LASSO for more interpretability (feature selection)
+
+ENET for slightly more stable coeffecients
+
+HORRENDOUS F1 SCORE when not treating any imbalanced data stuff.
+
+### Tree-based
+
+Mostly original data minus some columns for tree based modelling
+
+```{r}
+df_tree_modelling <- df_eda %>%
+  select(-median_age, -min_age, -max_age, -generations, -age_range, -boost_4_length, -boost_5_length, -boost_6_length, -boost_7_length, -boost_8_length)
+```
+
+```{r}
+write_csv(df_tree_modelling, '/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/pre_modelling_untransformed_data.csv')
+```
+
+```{r}
+set.seed(222)
+rf_model <- randomForest(convert ~ ., data = df_tree_modelling, ntree = 500, mtry = floor(sqrt(ncol(df_tree_modelling) - 1)), importance = TRUE)
+
+print(rf_model)
+varImpPlot(rf_model)
+
+rf_pred <- predict(rf_model, df_tree_modelling, type = "prob")[,2]
+```
+
+```{r}
+# f1 score rf
+f1 <- (2 * 1152/(1152 + 1142) * 1152 / (1152 + 7849))/(1152/(1152 + 1142) + 1152 / (1152 + 7849))
+f1
+```
+
+```{r}
+X <- model.matrix(convert ~ ., df_tree_modelling)[, -1]
+y <- ifelse(df_tree_modelling$convert == "YES", 1, 0)
+
+set.seed(333)
+train_index <- sample(seq_len(nrow(X)), 0.8 * nrow(X))
+dtrain <- xgb.DMatrix(data = X[train_index, ], label = y[train_index])
+dtest  <- xgb.DMatrix(data = X[-train_index, ], label = y[-train_index])
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 5,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 200,
+  watchlist = list(train = dtrain, test = dtest),
+  print_every_n = 20,
+  early_stopping_rounds = 20
+)
+
+xgb_pred <- predict(xgb_model, dtest)
+```
+
+grid search stuff
+
+```{r}
+set.seed(444)
+df_tree_modelling$convert <- as.factor(df_tree_modelling$convert)
+
+# CV setup (stratified k-fold)
+ctrl <- trainControl(
+  method = "cv", number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,  # gives ROC
+  savePredictions = "final"
+)
+
+# Candidate grid (tune mtry; can also vary ntree via tuneLength or loop)
+p <- ncol(df_tree_modelling) - 1
+rf_grid <- expand.grid(mtry = unique(pmax(1, round(c(sqrt(p)/2, sqrt(p), 1.5*sqrt(p), 2*sqrt(p))))))
+
+rf_fit <- train(
+  convert ~ ., data = df_tree_modelling,
+  method = "rf",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneGrid = rf_grid,
+  ntree = 500,
+  importance = TRUE
+)
+
+rf_fit
+varImp(rf_fit)
+
+# best model predictions
+rf_pred <- predict(rf_fit, df_tree_modelling, type = "prob")[, 1]
+
+```
+
+## Imbalanced data processing section
+
+## Decision Threshold Optimisation
+
+```{r}
+glm_basic <- glm(convert ~ ., data = df_modelling, family = binomial)
+
+cv_lasso  <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 1)
+cv_ridge  <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 0)
+cv_enet   <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 0.5)
+
+pred_lasso <- predict(cv_lasso, newx = X_test, type = "response", s = "lambda.min")
+pred_ridge <- predict(cv_ridge, newx = X_test, type = "response", s = "lambda.min")
+pred_enet  <- predict(cv_enet,  newx = X_test, type = "response", s = "lambda.min")
+
+optimize_threshold <- function(predictions, actual, metric = "f1") {
+  thresholds <- seq(0.1, 0.9, by = 0.01)
+  results <- data.frame(
+    threshold = thresholds,
+    accuracy = NA,
+    precision = NA,
+    recall = NA,
+    f1 = NA,
+    specificity = NA,
+    balanced_acc = NA,
+    youden = NA
+  )
+  
+  for (i in seq_along(thresholds)) {
+    thresh <- thresholds[i]
+    pred_class <- ifelse(predictions > thresh, 1, 0)
+    
+    # confusion matrix elements
+    tp <- sum(pred_class == 1 & actual == 1)
+    tn <- sum(pred_class == 0 & actual == 0)
+    fp <- sum(pred_class == 1 & actual == 0)
+    fn <- sum(pred_class == 0 & actual == 1)
+    
+    results$accuracy[i] <- (tp + tn) / (tp + tn + fp + fn)
+    results$precision[i] <- ifelse(tp + fp > 0, tp / (tp + fp), 0)
+    results$recall[i] <- ifelse(tp + fn > 0, tp / (tp + fn), 0)
+    results$f1[i] <- ifelse(results$precision[i] + results$recall[i] > 0,
+                            2 * results$precision[i] * results$recall[i] / 
+                              (results$precision[i] + results$recall[i]), 0)
+    results$specificity[i] <- ifelse(tn + fp > 0, tn / (tn + fp), 0)
+    results$balanced_acc[i] <- (results$recall[i] + results$specificity[i]) / 2
+    results$youden[i] <- results$recall[i] + results$specificity[i] - 1
+  }
+  
+  optimal_idx <- which.max(results[[metric]])
+  optimal_threshold <- results$threshold[optimal_idx]
+  
+  return(list(
+    optimal_threshold = optimal_threshold,
+    all_results = results,
+    best_metrics = results[optimal_idx, ]
+  ))
+}
+
+cat("=== LASSO MODEL ===\n")
+opt_lasso <- optimize_threshold(pred_lasso, y_test, metric = "f1")
+cat("Optimal threshold (F1):", opt_lasso$optimal_threshold, "\n")
+print(opt_lasso$best_metrics)
+
+cat("\n=== RIDGE MODEL ===\n")
+opt_ridge <- optimize_threshold(pred_ridge, y_test, metric = "f1")
+cat("Optimal threshold (F1):", opt_ridge$optimal_threshold, "\n")
+print(opt_ridge$best_metrics)
+
+cat("\n=== ELASTIC NET MODEL ===\n")
+opt_enet <- optimize_threshold(pred_enet, y_test, metric = "f1")
+cat("Optimal threshold (F1):", opt_enet$optimal_threshold, "\n")
+print(opt_enet$best_metrics)
+
+cat("\n=== COMPARISON: Default (0.5) vs Optimized Threshold ===\n")
+
+evaluate_at_threshold <- function(predictions, actual, threshold) {
+  pred_class <- ifelse(predictions > threshold, 1, 0)
+  cm <- confusionMatrix(factor(pred_class, levels = c(0, 1)), 
+                        factor(actual, levels = c(0, 1)), 
+                        positive = "1")
+  return(cm)
+}
+
+
+cat("\nLASSO - Default threshold (0.5):\n")
+cm_default <- evaluate_at_threshold(pred_lasso, y_test, 0.5)
+print(cm_default)
+
+cat("\nLASSO - Optimized threshold (", opt_lasso$optimal_threshold, "):\n")
+cm_optimized <- evaluate_at_threshold(pred_lasso, y_test, opt_lasso$optimal_threshold)
+print(cm_optimized)
+
+# ridge
+
+# enet
+
+par(mfrow = c(2, 2))
+
+# lasso plot
+plot(opt_lasso$all_results$threshold, opt_lasso$all_results$f1, 
+     type = "l", col = "blue", lwd = 2,
+     xlab = "Threshold", ylab = "Score", main = "LASSO: Metrics vs Threshold",
+     ylim = c(0, 1))
+lines(opt_lasso$all_results$threshold, opt_lasso$all_results$precision, 
+      col = "red", lwd = 2)
+lines(opt_lasso$all_results$threshold, opt_lasso$all_results$recall, 
+      col = "green", lwd = 2)
+lines(opt_lasso$all_results$threshold, opt_lasso$all_results$balanced_acc, 
+      col = "purple", lwd = 2)
+abline(v = opt_lasso$optimal_threshold, lty = 2, col = "black")
+legend("topright", legend = c("F1", "Precision", "Recall", "Balanced Acc", "Optimal"),
+       col = c("blue", "red", "green", "purple", "black"), lty = c(1,1,1,1,2), lwd = 2)
+
+# ROC Lasso
+roc_lasso <- roc(y_test, as.vector(pred_lasso))
+plot(roc_lasso, main = paste("LASSO ROC (AUC =", round(auc(roc_lasso), 3), ")"))
+
+# precision-recall trade-off
+plot(opt_lasso$all_results$recall, opt_lasso$all_results$precision, 
+     type = "l", col = "darkblue", lwd = 2,
+     xlab = "Recall", ylab = "Precision", 
+     main = "LASSO: Precision-Recall Curve")
+grid()
+
+# all model comparison
+model_comparison <- data.frame(
+  Model = c("Lasso", "Ridge", "ElasticNet"),
+  F1_Score = c(opt_lasso$best_metrics$f1, 
+               opt_ridge$best_metrics$f1, 
+               opt_enet$best_metrics$f1),
+  Threshold = c(opt_lasso$optimal_threshold,
+                opt_ridge$optimal_threshold,
+                opt_enet$optimal_threshold)
+)
+barplot(model_comparison$F1_Score, names.arg = model_comparison$Model,
+        main = "Model Comparison (Optimized F1)",
+        ylab = "F1 Score", col = c("steelblue", "coral", "seagreen"),
+        ylim = c(0, 1))
+
+par(mfrow = c(1, 1))
+
+lasso_class_opt <- ifelse(pred_lasso > opt_lasso$optimal_threshold, 1, 0)
+ridge_class_opt <- ifelse(pred_ridge > opt_ridge$optimal_threshold, 1, 0)
+enet_class_opt  <- ifelse(pred_enet  > opt_enet$optimal_threshold, 1, 0)
+
+calc_f1 <- function(pred_class, actual) {
+  tp <- sum(pred_class == 1 & actual == 1)
+  fp <- sum(pred_class == 1 & actual == 0)
+  fn <- sum(pred_class == 0 & actual == 1)
+  precision <- tp / (tp + fp)
+  recall <- tp / (tp + fn)
+  f1 <- 2 * precision * recall / (precision + recall)
+  return(f1)
+}
+
+cat("\n=== FINAL RESULTS ===\n")
+cat("\nF1 Scores with optimized thresholds:\n")
+print(c(Lasso = calc_f1(lasso_class_opt, y_test),
+        Ridge = calc_f1(ridge_class_opt, y_test),
+        ElasticNet = calc_f1(enet_class_opt, y_test)))
+
+cat("\nOptimal thresholds:\n")
+print(c(Lasso = opt_lasso$optimal_threshold,
+        Ridge = opt_ridge$optimal_threshold,
+        ElasticNet = opt_enet$optimal_threshold))
+```
+
+## Up/down sampling
+
+```{r}
+X_train <- as.data.frame(X_train)
+```
+
+```{r}
+
+```
