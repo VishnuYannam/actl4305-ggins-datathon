@@ -1,0 +1,943 @@
+---
+title: "EDA_and_modelling_5oct"
+author: "Michael Wang"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(MASS)
+library(caret)
+library(pROC)
+```
+
+```{r}
+select <- dplyr::select
+
+setwd('/Users/michaelwang/Desktop/unsw/unsw\ actl/4305/Assignment')
+
+df <- read_csv('/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/actl4305-ggins-datathon/standardised_freely_quote_data_v2.csv')
+
+crime_indices <- read_csv('/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/cleaned_crime_indices.csv')
+
+df_trim <- df %>% 
+  select(-destinations, -traveller_ages, -quote_create_time, -matches("^boost_.*_date$"))
+
+df_clean <- df_trim %>%
+  mutate(
+    across(starts_with("boost_"), ~ if_else(is.na(.x), 0, .x)),
+    quote_hour = if_else(quote_hour > 23, 24, quote_hour)
+    )
+
+any(is.na(df_clean))
+
+df_discount <- df_clean %>%
+  mutate(
+    discount = as.numeric(str_extract(discount, "^[0-9]*"))
+  )
+
+
+character_colnames <- names(df_discount)[sapply(df_discount, is.character)]
+
+df_factors <- df_discount %>%
+  mutate(
+    across(all_of(character_colnames), ~ as.factor(.x))
+  )
+
+df_crime_scores <- df_factors %>%
+  mutate(quote_id = row_number()) %>%
+  left_join(crime_indices, by = "quote_id") %>%
+  select(-quote_id)
+
+df_crime_scores <- df_crime_scores %>%
+  rowwise() %>%
+  mutate(
+    median_crime_index = median(as.numeric(unlist(strsplit(crime_index, ", "))))
+  ) %>%
+  ungroup %>%
+  select(-crime_index)
+
+df_clean_quote_hour <- df_crime_scores %>%
+  mutate(quote_hour = if_else(quote_hour > 23, 24, quote_hour))
+
+df_extra_cancellation <- df_clean_quote_hour %>%
+  mutate(
+    extra_cancel_tier = case_when(
+      extra_cancellation == 0 ~ 0,
+      extra_cancellation <= 5000 ~ 1,
+      extra_cancellation > 5000 ~ 2,
+      TRUE ~ 1
+    )
+  ) %>%
+    select(-extra_cancellation)
+
+df_final <- df_extra_cancellation %>%
+  select(-quote_time)
+
+
+df_eda <- df_final
+
+
+df_large_quote_price <- df_eda[df_eda$quote_price > 5000,]
+df_large_lengths <- df_eda[df_eda$trip_length > 365,]
+
+df_capped <- df_eda
+
+cap_trip_len <- quantile(df_capped$trip_length, 0.99)
+df_capped$trip_length_capped <- pmin(df_capped$trip_length, cap_trip_len)
+
+cap_price <- quantile(df_capped$quote_price, 0.99)
+df_capped$quote_price_capped <- pmin(df_capped$quote_price, cap_price)
+
+cap_lead_len <- quantile(df_capped$lead_length, 0.99)
+df_capped$lead_length_capped <- pmin(df_capped$lead_length, cap_lead_len)
+
+boost_cols_1_2 <- paste0("boost_", 1:2, "_length")
+for (col in boost_cols_1_2) {
+  cap_val <- quantile(df_capped[[col]], 0.99)
+  df_capped[[col]] <- pmin(df_capped[[col]], cap_val)
+}
+
+boost_cols_3_4_5 <- paste0("boost_", 3:5, "_length")
+for (col in boost_cols_3_4_5) {
+  cap_val <- quantile(df_capped[[col]], 0.999)
+  df_capped[[col]] <- pmin(df_capped[[col]], cap_val)
+}
+
+boost_cols_6_7_8 <- paste0("boost_", 6:8, "_length")
+for (col in boost_cols_6_7_8) {
+  cap_val <- quantile(df_capped[[col]], 0.999)
+  df_capped[[col]] <- pmin(df_capped[[col]], cap_val)
+}
+
+cap_age_range <- quantile(df_capped$age_range, 0.99)
+df_capped$age_range_capped <- pmin(df_capped$age_range, cap_age_range)
+
+df_capped <- df_capped %>%
+  select(-trip_length, -quote_price, -lead_length, -age_range)
+
+df_correlation <- df_capped %>%
+  select(-median_age, -min_age, -max_age)
+
+
+df_correlation <- df_correlation %>%
+  select(-generations, -age_range_capped, -boost_4_length, -boost_5_length, -boost_6_length, -boost_7_length, -boost_8_length)
+
+df_pretransform_modelling <- df_correlation
+
+df_transformations <- df_correlation
+
+box_cox_cols <- c(
+  "mean_age",
+  "trip_length_capped",
+  "quote_price_capped",
+  "lead_length_capped",
+  paste0("boost_", 1:3, "_length")
+)
+
+small <- 1e-6
+for (col in box_cox_cols) {
+  zero_flag <- min(df_transformations[[col]])
+  if (zero_flag <= 0) {
+    df_transformations[[col]] <- df_transformations[[col]] + small
+  }
+}
+
+X <- as.data.frame(df_transformations[, box_cox_cols])
+
+preprocess_boxcox <- preProcess(X, method = "BoxCox")
+X_boxcox  <- predict(preprocess_boxcox, X)
+
+df_transformations[paste0(names(X_boxcox), "_boxcox")] <- X_boxcox
+
+z_cols <- paste0(box_cox_cols, "_boxcox")
+X <- as.data.frame(df_transformations[, z_cols])
+preprocess_z <- preProcess(X, method = c("center", "scale"))
+X_z <- predict(preprocess_z, X)
+
+df_transformations[paste0(box_cox_cols, "_boxcox_z")] <- X_z
+
+df_transformations <- df_transformations %>%
+  select(-ends_with("_boxcox"), -all_of(box_cox_cols))
+
+df_transformations_1 <- df_transformations
+
+remaining_z_cols <- c(
+  "median_crime_index",
+  "num_adults",
+  "boost_num",
+  "num_travellers",
+  "discount"
+)
+
+small <- 1e-6
+for (col in remaining_z_cols) {
+  zero_flag <- min(df_transformations_1[[col]])
+  if (zero_flag <= 0) {
+    df_transformations_1[[col]] <- df_transformations_1[[col]] + small
+  }
+}
+
+X_z_df <- as.data.frame(df_transformations_1[, remaining_z_cols])
+preprocess_z <- preProcess(X_z_df, method = c("center", "scale"))
+X_z <- predict(preprocess_z, X_z_df)
+df_transformations_1[paste0(remaining_z_cols, "_z")] <- X_z
+
+df_transformations_1 <- df_transformations_1 %>%
+  select(-all_of(remaining_z_cols))
+
+
+df_modelling <- df_transformations_1
+```
+
+# No imb data proc
+
+### Train/Test/Val
+
+```{r}
+# model.matrix converts to numeric matrix to run regression, [, -1] removes convert column
+X <- model.matrix(convert ~ ., df_modelling)[, -1]
+y <- ifelse(df_modelling$convert == "YES", 1, 0)
+
+set.seed(111)
+# regular sampling:
+# train_index <- sample(seq_len(nrow(X)), 0.8 * nrow(X))
+
+# stratified sampling to make sure test and train have equal proportions of converted and non-converted customers - checking proportions it seems like the original sampling was already pretty good. Still, worth making precise.
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+# 0.25 of 0.8 is 0.2 of total
+
+X_train <- X[train_index,]
+y_train <- y[train_index]
+
+validation_index <- createDataPartition(y_train, p = 0.25, list = FALSE)
+X_val <- X_train[validation_index,]
+y_val <- y_train[validation_index]
+X_train_inner <- X_train[-validation_index, ]
+y_train_inner <- y_train[-validation_index]
+
+X_test <- X[-train_index,]
+y_test <- y[-train_index]
+
+# length(y_train_inner) / length(y)
+# length(y_val) / length(y)
+# length(y_test) / length(y)
+
+validation_index_df <- createDataPartition(Train_Data$convert, p = 0.25, list = FALSE)
+
+Train_Data <- df_modelling[train_index,]
+Validation_Data <- Train_Data[validation_index_df, ]
+Train_Data_inner<- Train_Data[-validation_index_df, ]
+Test_Data <- df_modelling[-train_index,]
+y_test_glm <- ifelse(Test_Data$convert == "YES", 1, 0)
+y_validation_glm <- ifelse(Validation_Data$convert == "YES", 1, 0)
+
+```
+
+### GLM/Shrinkage
+
+```{r}
+glm_basic <- glm(convert ~ ., data = Train_Data, family = binomial)
+# summary(glm_basic)
+```
+
+```{r}
+# ridge (alpha = 0), lasso (alpha = 1), elastic Net (0 < alpha < 1)
+# then check best one. At the same time, also runs default 10 fold cv on training data to pick best lambda
+# hyperparameter for shrinkage to control degree of penalty applied.
+cv_lasso <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 1)
+cv_ridge <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 0)
+cv_enet <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 0.5)
+```
+
+```{r}
+# # cv_lasso, etc. are cv.glmnet objects - running coef on them returns a sparse coeff matrix with one col of the
+# # fitted coeffecients, with intercept in first row. This is with the best lambda, stored in the cv.glmnet object.
+coef_lasso <- coef(cv_lasso, s = "lambda.min")
+# coef_ridge <- coef(cv_ridge, s = "lambda.min")
+# coef_enet <- coef(cv_enet, s = "lambda.min")
+
+# # this extracts that column of coeffecients, keeps only the non 0 ones, and keeps it as a matrix (drop = false to
+# prevent dropping into a vector); then returns top 20.
+lasso_nonzero <- coef_lasso[coef_lasso[,1] != 0, , drop = FALSE]
+sort(lasso_nonzero[,1], decreasing = TRUE)[1:20]
+
+# ridge_nonzero <- coef_ridge[coef_ridge[,1] != 0, , drop = FALSE]
+# sort(ridge_nonzero[,1], decreasing = TRUE)[1:20]
+
+# enet_nonzero <- coef_enet[coef_enet[,1] != 0, , drop = FALSE]
+# sort(enet_nonzero[,1], decreasing = TRUE)[1:20]
+
+# # cv error vs log(lambda)
+# plot(cv_lasso)
+# plot(cv_ridge)
+# plot(cv_enet)
+```
+
+```{r}
+# type = response means to give probabilities for logistic reg instead of values for normal regression
+# predict() as a universal apply data to model base r function
+
+# idea of using dataframe for glm prediction and matrix for shrinkage prediction i think is because of the code inside
+# the glm model saw the original data, so it was the test data in the same form to help process. The shrinkage never
+# saw the dataframe only a matrix rep, so thus it wants it in the same format.
+
+pred_glm <- predict(glm_basic, newdata = Test_Data, type = "response")
+pred_lasso <- predict(cv_lasso, newx = X_test, type = "response", s = "lambda.min")
+pred_ridge <- predict(cv_ridge, newx = X_test, type = "response", s = "lambda.min")
+pred_enet <- predict(cv_enet, newx = X_test, type = "response", s = "lambda.min")
+
+glm_class <- ifelse(pred_glm > 0.5, 1, 0)
+lasso_class <- ifelse(pred_lasso > 0.5, 1, 0)
+ridge_class <- ifelse(pred_ridge > 0.5, 1, 0)
+enet_class <- ifelse(pred_enet > 0.5, 1, 0)
+
+acc_glm <- mean(glm_class == y_test_glm)
+acc_lasso <- mean(lasso_class == y_test)
+acc_ridge <- mean(ridge_class == y_test)
+acc_enet <- mean(enet_class == y_test)
+
+c(glm = acc_glm, Lasso = acc_lasso, Ridge = acc_ridge, ElasticNet = acc_enet)
+```
+
+```{r}
+calculate_metrics <- function(predictions, actual) {
+  tp <- sum(predictions == 1 & actual == 1)
+  tn <- sum(predictions == 0 & actual == 0)
+  fp <- sum(predictions == 1 & actual == 0)
+  fn <- sum(predictions == 0 & actual == 1)
+  
+  accuracy <- (tp + tn) / (tp + tn + fp + fn)
+  precision <- tp / (tp + fp)
+  recall <- tp / (tp + fn)
+  sensitivity <- recall
+  specificity <- tn / (tn + fp)
+  f1 <- 2 * precision * recall / (precision + recall)
+  
+  return(c(
+    Accuracy = accuracy,
+    Precision = precision,
+    Recall = recall,
+    Specificity = specificity,
+    F1_Score = f1,
+  ))
+}
+
+metrics_glm <- calculate_metrics(glm_class, y_test_glm)
+metrics_lasso <- calculate_metrics(lasso_class, y_test)
+metrics_ridge <- calculate_metrics(ridge_class, y_test)
+metrics_enet  <- calculate_metrics(enet_class, y_test)
+
+comparison_table <- data.frame(
+  GLM = metrics_glm,
+  Lasso = metrics_lasso,
+  Ridge = metrics_ridge,
+  ElasticNet = metrics_enet
+)
+
+print(round(comparison_table, 4))
+```
+
+```{r}
+library(pROC)
+roc_glm <- roc(y_test_glm, as.vector(pred_glm))
+roc_lasso <- roc(y_test, as.vector(pred_lasso))
+roc_ridge <- roc(y_test, as.vector(pred_ridge))
+roc_enet <- roc(y_test, as.vector(pred_enet))
+
+auc(roc_glm)
+auc(roc_lasso)
+auc(roc_ridge)
+auc(roc_enet)
+```
+
+LASSO for more interpretability (feature selection)
+
+ENET for slightly more stable coeffecients
+
+HORRENDOUS F1 SCORE when not treating any imbalanced data stuff.
+
+## RF
+
+```{r}
+df_tree_modelling <- df_eda %>%
+  select(-median_age, -min_age, -max_age, -generations, -age_range)
+```
+
+```{r}
+set.seed(111)
+df_tree_modelling$convert <- factor(df_tree_modelling$convert, , levels = c("NO","YES"))
+
+y_tree <- df_tree_modelling$convert
+train_index <- createDataPartition(y_tree, p = 0.8, list = FALSE)
+
+y_train_tree <- y[train_index]
+validation_index <- createDataPartition(y_train_tree, p = 0.25, list = FALSE)
+
+tree_train <- df_tree_modelling[train_index, ]
+tree_train_inner <- df_tree_modelling[-validation_index, ]
+tree_val <- tree_train[validation_index, ]
+tree_test <- df_tree_modelling[-train_index, ]
+y_val_tree <- as.numeric(ifelse(tree_val$convert == "YES", 1, 0))
+y_test_tree <- as.numeric(ifelse(tree_test$convert == "YES", 1, 0))
+
+set.seed(222)
+rf <- randomForest(
+  convert ~ .,
+  data = tree_train,
+  ntree = 500,
+  mtry = floor(sqrt(ncol(tree_train) - 1)),
+  importance = TRUE
+)
+
+# type = prob returns probabilities instead of class labels. This is for several reasons,
+# first is calculating metrics like ROC or just probability in general, and second for
+# later decision threshold tuning. [, "YES"] means we select the YES probability column.
+pred_test <- predict(rf, tree_test, type = "prob")[, "YES"]
+pred_class <- ifelse(pred_test >= 0.5, 1, 0)
+rf_metrics <- calculate_metrics(pred_class, y_test_tree)
+
+# RUN THESE ONLY
+rf_metrics
+print(rf)
+varImpPlot(rf)
+```
+
+# Imb data procs
+
+## GLM DTO
+
+```{r}
+optimise_threshold <- function(predictions, actual, metric = "f1") {
+  thresholds <- seq(0.1, 0.9, by = 0.01)
+  results <- data.frame(
+    threshold = thresholds,
+    accuracy = NA,
+    precision = NA,
+    recall = NA,
+    f1 = NA,
+    specificity = NA
+  )
+  
+  # quick logic for this loop: predictions is a numeric vector of probabilities. Use an if else to change this vector
+  # into class labels 1 or 0 according to the new threshold. Scan across all the thresholds, calculate true pos, true
+  # neg, false pos and false neg. Then use these to calculate the diff metrics to eventually get to F1 score.
+  
+  # At the end, we have a results data frame. Append each metric into the result data frame, such that each metric in 
+  # the result data frame is a list of the metrics for each threshold level.
+  
+  for (i in seq_along(thresholds)) {
+    threshold <- thresholds[i]
+    pred_class <- ifelse(predictions > threshold, 1, 0)
+    
+    tp <- sum(pred_class == 1 & actual == 1)
+    tn <- sum(pred_class == 0 & actual == 0)
+    fp <- sum(pred_class == 1 & actual == 0)
+    fn <- sum(pred_class == 0 & actual == 1)
+    
+    results$accuracy[i] <- (tp + tn) / (tp + tn + fp + fn)
+    results$precision[i] <- tp / (tp + fp)
+    results$recall[i] <- tp / (tp + fn)
+    results$f1[i] <- 2 * results$precision[i] * results$recall[i] / (results$precision[i] + results$recall[i])
+    results$specificity[i] <- tn / (tn + fp)
+  }
+  
+  # which picks out the index of the list which is the highest. We can decide which metric to use. Here we default
+  # to F1 since its the best indicator overall esp for this imbalanced data.
+  # then we extract the threshold that corresponds do it, and return everything.
+  
+  optimal_index <- which.max(results[[metric]])
+  optimal_threshold <- results$threshold[optimal_index]
+  
+  return(list(
+    optimal_threshold = optimal_threshold,
+    all_results = results,
+    best_metrics = results[optimal_index, ]
+  ))
+}
+```
+
+```{r}
+glm_dt_opt <- glm(convert ~ ., data = Train_Data_inner, family = binomial)
+cv_lasso_dt_opt <- cv.glmnet(X_train_inner, y_train_inner,
+                             family = "binomial", alpha = 1)
+cv_ridge_dt_opt <- cv.glmnet(X_train_inner, y_train_inner,
+                             family = "binomial", alpha = 0)
+cv_enet_dt_opt <- cv.glmnet(X_train_inner, y_train_inner,
+                            family = "binomial", alpha = 0.5)
+
+pred_glm_dt_opt_val <- predict(glm_dt_opt, newdata = Validation_Data, type = "response")
+pred_lasso_dt_opt_val <- predict(cv_lasso_dt_opt, newx = X_val, type = "response",
+                      s = "lambda.min")
+pred_ridge_dt_opt_val <- predict(cv_ridge_dt_opt, newx = X_val, type = "response",
+                      s = "lambda.min")
+pred_enet_dt_opt_val <- predict(cv_enet_dt_opt,  newx = X_val, type = "response",
+                     s = "lambda.min")
+
+opt_glm_dt_opt <- optimise_threshold(pred_glm_dt_opt_val, y_validation_glm, metric = "f1")
+opt_lasso_dt_opt <- optimise_threshold(pred_lasso_dt_opt_val, y_val, metric = "f1")
+opt_ridge_dt_opt <- optimise_threshold(pred_ridge_dt_opt_val, y_val, metric = "f1")
+opt_enet_dt_opt <- optimise_threshold(pred_enet_dt_opt_val, y_val, metric = "f1")
+```
+
+```{r}
+res_lasso_dt_opt <- opt_lasso_dt_opt$all_results
+
+ggplot(res_lasso_dt_opt, aes(x = threshold, y = f1)) +
+  geom_line() +
+  geom_vline(xintercept = opt_lasso_dt_opt$optimal_threshold, linetype = 2) +
+  geom_point(data = subset(res_lasso_dt_opt,
+                           threshold == opt_lasso_dt_opt$optimal_threshold),
+             aes(x = threshold, y = f1), size = 2) +
+  labs(title = "Decision Threshold Optimisation (F1)",
+       subtitle = paste("Optimal threshold =",
+                        round(opt_lasso_dt_opt$optimal_threshold, 3)),
+       x = "Threshold", y = "F1 score") +
+  theme_minimal()
+```
+
+```{r}
+# ValidatioN Results After Tuning Decision Threshold
+res_glm_dt_opt <- opt_glm_dt_opt$all_results
+res_ridge_dt_opt <- opt_ridge_dt_opt$all_results
+res_enet_dt_opt <- opt_enet_dt_opt$all_results
+
+res_glm_dt_opt[res_glm_dt_opt$threshold == opt_glm_dt_opt$optimal_threshold,]
+res_lasso_dt_opt[res_lasso_dt_opt$threshold == opt_lasso_dt_opt$optimal_threshold,]
+res_ridge_dt_opt[res_ridge_dt_opt$threshold == opt_ridge_dt_opt$optimal_threshold,]
+res_enet_dt_opt[res_enet_dt_opt$threshold == opt_enet_dt_opt$optimal_threshold,]
+```
+
+```{r}
+# Model Eval Using Test Set
+pred_glm_dt_opt <- predict(glm_dt_opt, newdata = Test_Data, type = "response")
+pred_lasso_dt_opt <- predict(cv_lasso_dt_opt, newx = X_test, type = "response",
+                      s = "lambda.min")
+pred_ridge_dt_opt <- predict(cv_ridge_dt_opt, newx = X_test, type = "response",
+                      s = "lambda.min")
+pred_enet_dt_opt <- predict(cv_enet_dt_opt,  newx = X_test, type = "response",
+                     s = "lambda.min")
+
+glm_class_dt_opt <- ifelse(pred_glm_dt_opt > opt_glm_dt_opt$optimal_threshold, 1, 0)
+lasso_class_dt_opt <- ifelse(pred_lasso_dt_opt > opt_lasso_dt_opt$optimal_threshold,
+                             1, 0)
+ridge_class_dt_opt <- ifelse(pred_ridge_dt_opt > opt_ridge_dt_opt$optimal_threshold,
+                             1, 0)
+enet_class_dt_opt <- ifelse(pred_enet_dt_opt  > opt_enet_dt_opt$optimal_threshold, 1, 0)
+
+metrics_glm_dt_opt <- calculate_metrics(glm_class_dt_opt, y_test_glm)
+metrics_lasso_dt_opt <- calculate_metrics(lasso_class_dt_opt, y_test)
+metrics_ridge_dt_opt <- calculate_metrics(ridge_class_dt_opt, y_test)
+metrics_enet_dt_opt <- calculate_metrics(enet_class_dt_opt,  y_test)
+
+comparison_table <- data.frame(
+  GLM = metrics_glm_dt_opt,
+  Lasso = metrics_lasso_dt_opt,
+  Ridge = metrics_ridge_dt_opt,
+  ElasticNet = metrics_enet_dt_opt
+)
+comparison_table
+
+```
+
+## RF DTO
+
+```{r}
+set.seed(222)
+rf_dto <- randomForest(
+  convert ~ .,
+  data = tree_train_inner,
+  ntree = 500,
+  mtry  = floor(sqrt(ncol(tree_train_inner) - 1)),
+  importance = TRUE
+)
+
+pred_val <- predict(rf_dto, tree_val, type = "prob")[, "YES"]
+opt_rf_dto <- optimise_threshold(pred_val, y_val_tree, metric = "f1")
+res_opt_rf_dto <- opt_rf_dto$all_results
+cat("Validation Results")
+res_opt_rf_dto[res_opt_rf_dto$threshold == opt_rf_dto$optimal_threshold,]
+
+pred_test_dto <- predict(rf, tree_test, type = "prob")[, "YES"]
+rf_class_dt_opt <- ifelse(pred_test_dto > opt_rf_dto$optimal_threshold, 1, 0)
+metrics_rf_dto <- calculate_metrics(rf_class_dt_opt, y_test_tree)
+metrics_rf_dto
+```
+
+## U/D Sampling
+
+glmnet / cv.glmnet (logistic) - for family="binomial", glmnet expects a binary outcome. It accepts either numeric 0/1, or a 2-level factor (internally converted to 0/1 with the first level as 0). Turning it into numeric makes it simple and less error prone (0/1 encoding)
+
+randomForest - in rf, the task is inferred from the type of y. if y is factor, it is classification forest (type="prob" gives class probs as mentioned earlier). if y is numeric, we will get a regression forest (continuous outputs; no type="prob").
+
+Thus pass numeric into glm but factor into
+
+```{r}
+X_train_matrix <- as.data.frame(X_train)
+y_train_fac <- droplevels(as.factor(y_train))
+
+set.seed(123)
+train_up <- upSample(x = X_train_matrix, y = y_train_fac, yname = "convert")
+X_train_up <- data.matrix(subset(train_up, select = -convert))
+y_train_up <- as.numeric(as.character(train_up$convert))
+
+set.seed(123)
+train_down <- downSample(x = X_train_matrix, y = y_train_fac, yname = "convert")
+X_train_down <- data.matrix(subset(train_down, select = -convert))
+y_train_down <- as.numeric(as.character(train_down$convert))
+
+Train_Data_up <- Train_Data
+Train_Data_up$convert <- factor(Train_Data_up$convert, levels = c("NO","YES"))
+
+up_train <- upSample(x = subset(Train_Data_up, select = -convert),
+                     y = Train_Data_up$convert, yname = "convert")
+
+Train_Data_down <- Train_Data
+Train_Data_down$convert <- factor(Train_Data_down$convert, levels = c("NO","YES"))
+
+down_train <- upSample(x = subset(Train_Data_down, select = -convert),
+                     y = Train_Data_down$convert, yname = "convert")
+# prop table is just table but in proportions
+# prop.table(table(y_train))
+# prop.table(table(y_train_up))
+# prop.table(table(y_train_down))
+
+X_train_inner_matrix <- as.data.frame(X_train_inner)
+y_train_inner_fac <- droplevels(as.factor(y_train_inner))
+
+set.seed(123)
+train_up_inner <- upSample(x = X_train_inner_matrix, y = y_train_inner_fac, yname = "convert")
+X_train_inner_up <- data.matrix(subset(train_up_inner, select = -convert))
+y_train_inner_up <- as.numeric(as.character(train_up_inner$convert))
+
+set.seed(123)
+train_down_inner <- downSample(x = X_train_inner_matrix, y = y_train_inner_fac, yname = "convert")
+X_train_inner_down <- data.matrix(subset(train_down_inner, select = -convert))
+y_train_inner_down <- as.numeric(as.character(train_down_inner$convert))
+
+Train_Data_inner_up <- Train_Data_inner
+Train_Data_inner_up$convert <- factor(Train_Data_inner_up$convert, levels = c("NO","YES"))
+
+up_train_inner <- upSample(x = subset(Train_Data_inner_up, select = -convert),
+                     y = Train_Data_inner_up$convert, yname = "convert")
+
+Train_Data_inner_down <- Train_Data_inner
+Train_Data_inner_down$convert <- factor(Train_Data_inner_down$convert, levels = c("NO","YES"))
+
+down_train_inner <- upSample(x = subset(Train_Data_inner_down, select = -convert),
+                     y = Train_Data_inner_down$convert, yname = "convert")
+
+```
+
+
+```{r}
+# set seed is a random number SEQUENCE setter - use it again before each random act to make sure each random act is reproducible individually
+set.seed(111)
+glm_up <- glm(convert ~ ., data = up_train, family = binomial)
+cv_lasso_up  <- cv.glmnet(X_train_up, y_train_up, family = "binomial", alpha = 1)
+cv_ridge_up  <- cv.glmnet(X_train_up, y_train_up, family = "binomial", alpha = 0)
+cv_enet_up   <- cv.glmnet(X_train_up, y_train_up, family = "binomial", alpha = 0.5)
+
+set.seed(111)
+glm_down <- glm(convert ~ ., data = down_train, family = binomial)
+cv_lasso_down <- cv.glmnet(X_train_down, y_train_down, family = "binomial", alpha = 1)
+cv_ridge_down <- cv.glmnet(X_train_down, y_train_down, family = "binomial", alpha = 0)
+cv_enet_down <- cv.glmnet(X_train_down, y_train_down, family = "binomial", alpha = 0.5)
+```
+
+```{r}
+pred_glm_up <- predict(glm_up, newdata = Test_Data, type = "response")
+pred_lasso_up <- predict(cv_lasso_up, newx = X_test, type = "response", s = "lambda.min")
+pred_ridge_up <- predict(cv_ridge_up, newx = X_test, type = "response", s = "lambda.min")
+pred_enet_up  <- predict(cv_enet_up,  newx = X_test, type = "response", s = "lambda.min")
+
+glm_class_up <- ifelse(pred_glm_up > 0.5, 1, 0)
+lasso_class_up <- ifelse(pred_lasso_up > 0.5, 1, 0)
+ridge_class_up <- ifelse(pred_ridge_up > 0.5, 1, 0)
+enet_class_up  <- ifelse(pred_enet_up  > 0.5, 1, 0)
+
+metrics_glm_up <- calculate_metrics(glm_class_up, y_test_glm)
+metrics_lasso_up <- calculate_metrics(lasso_class_up, y_test)
+metrics_ridge_up <- calculate_metrics(ridge_class_up, y_test)
+metrics_enet_up  <- calculate_metrics(enet_class_up,  y_test)
+
+comparison_table <- data.frame(
+  GLM = metrics_glm_up,
+  Lasso = metrics_lasso_up,
+  Ridge = metrics_ridge_up,
+  ElasticNet = metrics_enet_up
+)
+
+print(round(comparison_table, 4))
+```
+
+```{r}
+pred_glm_down <- predict(glm_down, newdata = Test_Data, type = "response")
+pred_lasso_down <- predict(cv_lasso_down, newx = X_test, type = "response",
+                           s = "lambda.min")
+pred_ridge_down <- predict(cv_ridge_down, newx = X_test, type = "response",
+                           s = "lambda.min")
+pred_enet_down <- predict(cv_enet_down, newx = X_test, type = "response",
+                          s = "lambda.min")
+
+glm_class_down <- ifelse(pred_glm_down > 0.5, 1, 0)
+lasso_class_down <- ifelse(pred_lasso_down > 0.5, 1, 0)
+ridge_class_down <- ifelse(pred_ridge_down > 0.5, 1, 0)
+enet_class_down <- ifelse(pred_enet_down  > 0.5, 1, 0)
+
+metrics_glm_down <- calculate_metrics(glm_class_down, y_test_glm)
+metrics_lasso_down <- calculate_metrics(lasso_class_down, y_test)
+metrics_ridge_down <- calculate_metrics(ridge_class_down, y_test)
+metrics_enet_down <- calculate_metrics(enet_class_down,  y_test)
+
+comparison_table <- data.frame(
+  GLM = metrics_glm_down,
+  Lasso = metrics_lasso_down,
+  Ridge = metrics_ridge_down,
+  ElasticNet = metrics_enet_down
+)
+print(round(comparison_table, 4))
+```
+
+## U/D Samp+DTO
+
+```{r}
+# attempt for u/d sampling with earlier optimal decision threshold
+# up:
+glm_class_up <- ifelse(pred_glm_up > opt_glm_dt_opt$optimal_threshold, 1, 0)
+lasso_class_up <- ifelse(pred_lasso_up > opt_lasso_dt_opt$optimal_threshold, 1, 0)
+ridge_class_up <- ifelse(pred_ridge_up > opt_ridge_dt_opt$optimal_threshold, 1, 0)
+enet_class_up <- ifelse(pred_enet_up > opt_enet_dt_opt$optimal_threshold, 1, 0)
+
+metrics_glm_up <- calculate_metrics(glm_class_up, y_test_glm)
+metrics_lasso_up <- calculate_metrics(lasso_class_up, y_test)
+metrics_ridge_up <- calculate_metrics(ridge_class_up, y_test)
+metrics_enet_up <- calculate_metrics(enet_class_up, y_test)
+
+comparison_table <- data.frame(
+  GLM = metrics_glm_up,
+  Lasso = metrics_lasso_up,
+  Ridge = metrics_ridge_up,
+  ElasticNet = metrics_enet_up
+)
+
+print(round(comparison_table, 4))
+
+glm_class_down <- ifelse(pred_glm_down > opt_glm$optimal_threshold, 1, 0)
+lasso_class_down <- ifelse(pred_lasso_down > opt_lasso$optimal_threshold, 1, 0)
+ridge_class_down <- ifelse(pred_ridge_down > opt_ridge$optimal_threshold, 1, 0)
+enet_class_down <- ifelse(pred_enet_down > opt_enet$optimal_threshold, 1, 0)
+
+metrics_glm_down <- calculate_metrics(glm_class_down, y_test_glm)
+metrics_lasso_down <- calculate_metrics(lasso_class_down, y_test)
+metrics_ridge_down <- calculate_metrics(ridge_class_down, y_test)
+metrics_enet_down <- calculate_metrics(enet_class_down, y_test)
+
+comparison_table <- data.frame(
+  GLM = metrics_glm_down,
+  Lasso = metrics_lasso_down,
+  Ridge = metrics_ridge_down,
+  ElasticNet = metrics_enet_down
+)
+print(round(comparison_table, 4))
+```
+
+```{r}
+# Actual optimisation:
+set.seed(111)
+glm_up_inner <- glm(convert ~ ., data = up_train_inner, family = binomial)
+cv_lasso_up_inner <- cv.glmnet(X_train_inner_up, y_train_inner_up,
+                          family = "binomial", alpha = 1)
+cv_ridge_up_inner <- cv.glmnet(X_train_inner_up, y_train_inner_up,
+                          family = "binomial", alpha = 0)
+cv_enet_up_inner <- cv.glmnet(X_train_inner_up, y_train_inner_up,
+                          family = "binomial", alpha = 0.5)
+
+set.seed(111)
+glm_down_inner <- glm(convert ~ ., data = down_train_inner, family = binomial)
+cv_lasso_down_inner <- cv.glmnet(X_train_inner_down, y_train_inner_down,
+                                 family = "binomial", alpha = 1)
+cv_ridge_down_inner <- cv.glmnet(X_train_inner_down, y_train_inner_down,
+                                 family = "binomial", alpha = 0)
+cv_enet_down_inner <- cv.glmnet(X_train_inner_down, y_train_inner_down,
+                                family = "binomial", alpha = 0.5)
+
+```
+
+```{r}
+pred_glm_up_inner <- predict(glm_up_inner, newdata = Validation_Data, type = "response")
+pred_lasso_up_inner <- predict(cv_lasso_up_inner, newx = X_val, type = "response", s = "lambda.min")
+pred_ridge_up_inner <- predict(cv_ridge_up_inner, newx = X_val, type = "response", s = "lambda.min")
+pred_enet_up_inner <- predict(cv_enet_up_inner,  newx = X_val, type = "response", s = "lambda.min")
+
+pred_glm_down_inner <- predict(glm_down_inner, newdata = Validation_Data,
+                               type = "response")
+pred_lasso_down_inner <- predict(cv_lasso_down_inner, newx = X_val, type = "response", s = "lambda.min")
+pred_ridge_down_inner <- predict(cv_ridge_down_inner, newx = X_val, type = "response", s = "lambda.min")
+pred_enet_down_inner <- predict(cv_enet_down_inner,  newx = X_val, type = "response", s = "lambda.min")
+```
+
+```{r}
+# up
+opt_glm_up_inner <- optimise_threshold(pred_glm_up_inner,
+                                       y_validation_glm, metric = "f1")
+opt_lasso_up_inner <- optimise_threshold(pred_lasso_up_inner, y_val, metric = "f1")
+opt_ridge_up_inner <- optimise_threshold(pred_ridge_up_inner, y_val, metric = "f1")
+opt_enet_up_inner <- optimise_threshold(pred_enet_up_inner, y_val, metric = "f1")
+
+res_glm_up_inner <- opt_glm_up_inner$all_results
+res_lasso_up_inner <- opt_lasso_up_inner$all_results
+res_ridge_up_inner <- opt_ridge_up_inner$all_results
+res_enet_up_inner <- opt_enet_up_inner$all_results
+
+res_glm_up_inner[res_glm_up_inner$threshold == opt_glm_up_inner$optimal_threshold,]
+res_lasso_up_inner[res_lasso_up_inner$threshold == opt_lasso_up_inner$optimal_threshold,]
+res_ridge_up_inner[res_ridge_up_inner$threshold == opt_ridge_up_inner$optimal_threshold,]
+res_enet_up_inner[res_enet_up_inner$threshold == opt_enet_up_inner$optimal_threshold,]
+
+# down
+opt_glm_down_inner <- optimise_threshold(pred_glm_down_inner,
+                                         y_validation_glm, metric = "f1")
+opt_lasso_down_inner <- optimise_threshold(pred_lasso_down_inner, y_val, metric = "f1")
+opt_ridge_down_inner <- optimise_threshold(pred_ridge_down_inner, y_val, metric = "f1")
+opt_enet_down_inner <- optimise_threshold(pred_enet_down_inner, y_val, metric = "f1")
+
+res_glm_down_inner <- opt_glm_down_inner$all_results
+res_lasso_down_inner <- opt_lasso_down_inner$all_results
+res_ridge_down_inner <- opt_ridge_down_inner$all_results
+res_enet_down_inner <- opt_enet_down_inner$all_results
+res_glm_down_inner[res_glm_down_inner$threshold == opt_glm_down_inner$optimal_threshold,]
+res_lasso_down_inner[res_lasso_down_inner$threshold ==
+                       opt_lasso_down_inner$optimal_threshold,]
+res_ridge_down_inner[res_ridge_down_inner$threshold ==
+                       opt_ridge_down_inner$optimal_threshold,]
+res_enet_down_inner[res_enet_down_inner$threshold ==
+                      opt_enet_down_inner$optimal_threshold,]
+```
+
+```{r}
+# test set
+# up
+pred_glm_up_inner <- predict(glm_up_inner, newdata = Test_Data, type = "response")
+pred_lasso_up_inner <- predict(cv_lasso_up_inner, newx = X_test, type = "response",
+                      s = "lambda.min")
+pred_ridge_up_inner <- predict(cv_ridge_up_inner, newx = X_test, type = "response",
+                      s = "lambda.min")
+pred_enet_up_inner <- predict(cv_enet_up_inner,  newx = X_test, type = "response",
+                     s = "lambda.min")
+
+glm_class_up_inner <- ifelse(pred_glm_up_inner > 
+                               opt_glm_up_inner$optimal_threshold, 1, 0)
+lasso_class_up_inner <- ifelse(pred_lasso_up_inner >
+                                 opt_lasso_up_inner$optimal_threshold, 1, 0)
+ridge_class_up_inner <- ifelse(pred_ridge_up_inner >
+                                 opt_ridge_up_inner$optimal_threshold, 1, 0)
+enet_class_up_inner  <- ifelse(pred_enet_up_inner  >
+                                 opt_enet_up_inner$optimal_threshold, 1, 0)
+
+metrics_glm_up_inner <- calculate_metrics(glm_class_up_inner, y_test_glm)
+metrics_lasso_up_inner <- calculate_metrics(lasso_class_up_inner, y_test)
+metrics_ridge_up_inner <- calculate_metrics(ridge_class_up_inner, y_test)
+metrics_enet_up_inner <- calculate_metrics(enet_class_up_inner, y_test)
+
+comparison_table_up_inner <- data.frame(
+  GLM = metrics_glm_up_inner,
+  Lasso = metrics_lasso_up_inner,
+  Ridge = metrics_ridge_up_inner,
+  ElasticNet = metrics_enet_up_inner
+)
+comparison_table_up_inner
+
+# down
+
+pred_glm_down_inner <- predict(glm_down_inner, newdata = Test_Data, type = "response")
+pred_lasso_down_inner <- predict(cv_lasso_down_inner, newx = X_test, type = "response",
+                      s = "lambda.min")
+pred_ridge_down_inner <- predict(cv_ridge_down_inner, newx = X_test, type = "response",
+                      s = "lambda.min")
+pred_enet_down_inner <- predict(cv_enet_down_inner,  newx = X_test, type = "response",
+                     s = "lambda.min")
+
+glm_class_down_inner <- ifelse(pred_glm_down_inner >
+                                 opt_glm_down_inner$optimal_threshold, 1, 0)
+lasso_class_down_inner <- ifelse(pred_lasso_down_inner >
+                                   opt_lasso_down_inner$optimal_threshold, 1, 0)
+ridge_class_down_inner <- ifelse(pred_ridge_down_inner >
+                                   opt_ridge_down_inner$optimal_threshold, 1, 0)
+enet_class_down_inner  <- ifelse(pred_enet_down_inner >
+                                   opt_enet_down_inner$optimal_threshold, 1, 0)
+
+glm_class_up_inner <- ifelse(pred_glm_up_inner > 0.5, 1, 0)
+lasso_class_up_inner <- ifelse(pred_lasso_up_inner > 0.5, 1, 0)
+ridge_class_up_inner <- ifelse(pred_ridge_up_inner > 0.5, 1, 0)
+enet_class_up_inner  <- ifelse(pred_enet_up_inner > 0.5, 1, 0)
+
+metrics_glm_down_inner <- calculate_metrics(glm_class_down_inner, y_test_glm)
+metrics_lasso_down_inner <- calculate_metrics(lasso_class_down_inner, y_test)
+metrics_ridge_down_inner <- calculate_metrics(ridge_class_down_inner, y_test)
+metrics_enet_down_inner <- calculate_metrics(enet_class_down_inner, y_test)
+
+comparison_table_down_inner <- data.frame(
+  GLM = metrics_glm_down_inner,
+  Lasso = metrics_lasso_down_inner,
+  Ridge = metrics_ridge_down_inner,
+  ElasticNet = metrics_enet_down_inner
+)
+comparison_table_down_inner
+
+```
+
+seems like overall performace is better without up or down sampling maybe? need to think about what metrics we really want to be using.
+
+# Next Steps - tuning, feature selection, weights, analysis of error and residuals
+
+To do:
+-   tune hyper parameters
+-   do better feature selection —\> hybrid/forward/backward subset feature selection
+-   try the weights 4 to 1 thing for lasso/enet after optimising decision boundary
+-   check if under or overfitting by comparing pure train and test error
+
+```{r}
+cv_lasso <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 1)
+train_preds <- predict(cv_lasso, newx = X_train, s = "lambda.min", type = "response")
+test_preds <- predict(cv_lasso, newx = X_test, s = "lambda.min", type = "response")
+
+opt_threshold <- opt_lasso$optimal_threshold
+train_class <- ifelse(train_preds > opt_threshold, 1, 0)
+test_class <- ifelse(test_preds > opt_threshold, 1, 0)
+
+train_error <- mean(train_class != y_train)
+test_error <- mean(test_class != y_test)
+
+cat("Training error:", round(train_error, 3), "\n")
+cat("Test error:", round(test_error, 3))
+```
+
+# underfitting? maybe a discuss for next week.
+
+```{r}
+library(MASS)
+step_model <- stepAIC(glm_basic, direction = "both", trace = FALSE)
+summary(step_model)
+formula(step_model)
+```
+
+-   stratified samplied didn't do much, the original sampling was already relatively well split between train and test for the target variable.
+
+-   tested model with more significant predictors, didn't change model too much
+
+-   tested using weights in cv.glmnet, worse overall than decision threshold optimisation
+
+To Do:
+
+-   loads of testing with different models, with different params, before and after box cox or z scaling
+
+-   loads of testing to do with hyperparams
