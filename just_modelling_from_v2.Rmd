@@ -24,9 +24,7 @@ library(pROC)
 ```{r}
 select <- dplyr::select
 
-setwd('/Users/michaelwang/Desktop/unsw/unsw\ actl/4305/Assignment')
-
-df <- read_csv('/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/actl4305-ggins-datathon/standardised_freely_quote_data_v2.csv')
+df <- read_csv('/Users/michaelwang/Desktop/unsw/unsw\ actl/4305/Assignment/standardised_freely_quote_data_v2.csv')
 
 crime_indices <- read_csv('/Users/michaelwang/Desktop/unsw/unsw actl/4305/Assignment/cleaned_crime_indices.csv')
 
@@ -129,7 +127,6 @@ df_capped <- df_capped %>%
 df_correlation <- df_capped %>%
   select(-median_age, -min_age, -max_age)
 
-
 df_correlation <- df_correlation %>%
   select(-generations, -age_range_capped, -boost_4_length, -boost_5_length, -boost_6_length, -boost_7_length, -boost_8_length)
 
@@ -196,7 +193,6 @@ df_transformations_1[paste0(remaining_z_cols, "_z")] <- X_z
 df_transformations_1 <- df_transformations_1 %>%
   select(-all_of(remaining_z_cols))
 
-
 df_modelling <- df_transformations_1
 ```
 
@@ -234,13 +230,14 @@ y_test <- y[-train_index]
 # length(y_test) / length(y)
 
 Train_Data <- df_modelling[train_index,]
-validation_index_df <- createDataPartition(Train_Data$convert, p = 0.25, list = FALSE)
-Validation_Data <- Train_Data[validation_index_df, ]
-Train_Data_inner<- Train_Data[-validation_index_df, ]
+# validation_index_df <- createDataPartition(Train_Data$convert, p = 0.25, list = FALSE)
+# Validation_Data <- Train_Data[validation_index_df, ]
+# Train_Data_inner<- Train_Data[-validation_index_df, ]
+Validation_Data <- Train_Data[validation_index, ]
+Train_Data_inner<- Train_Data[-validation_index, ]
 Test_Data <- df_modelling[-train_index,]
 y_test_glm <- ifelse(Test_Data$convert == "YES", 1, 0)
 y_validation_glm <- ifelse(Validation_Data$convert == "YES", 1, 0)
-
 ```
 
 ### GLM/Shrinkage
@@ -289,7 +286,7 @@ sort(lasso_nonzero[,1], decreasing = TRUE)[1:20]
 
 # idea of using dataframe for glm prediction and matrix for shrinkage prediction i think is because of the code inside
 # the glm model saw the original data, so it was the test data in the same form to help process. The shrinkage never
-# saw the dataframe only a matrix rep, so thus it wants it in the same format.
+# saw the data frame only a matrix rep, so thus it wants it in the same format.
 
 pred_glm <- predict(glm_basic, newdata = Test_Data, type = "response")
 pred_lasso <- predict(cv_lasso, newx = X_test, type = "response", s = "lambda.min")
@@ -374,21 +371,24 @@ df_tree_modelling <- df_eda %>%
 
 ```{r}
 set.seed(111)
-df_tree_modelling$convert <- factor(df_tree_modelling$convert, , levels = c("NO","YES"))
+# df_tree_modelling$convert <- factor(df_tree_modelling$convert, , levels = c("NO","YES"))
+df_tree_modelling$convert <- factor(df_tree_modelling$convert)
 
 y_tree <- df_tree_modelling$convert
 train_index <- createDataPartition(y_tree, p = 0.8, list = FALSE)
 
-y_train_tree <- y[train_index]
+y_train_tree <- y_tree[train_index]
 validation_index <- createDataPartition(y_train_tree, p = 0.25, list = FALSE)
 
 tree_train <- df_tree_modelling[train_index, ]
-tree_train_inner <- df_tree_modelling[-validation_index, ]
+tree_train_inner <- tree_train[-validation_index, ]
 tree_val <- tree_train[validation_index, ]
 tree_test <- df_tree_modelling[-train_index, ]
 y_val_tree <- as.numeric(ifelse(tree_val$convert == "YES", 1, 0))
 y_test_tree <- as.numeric(ifelse(tree_test$convert == "YES", 1, 0))
+```
 
+```{r}
 set.seed(222)
 rf <- randomForest(
   convert ~ .,
@@ -566,11 +566,16 @@ res_opt_rf_dto <- opt_rf_dto$all_results
 cat("Validation Results")
 res_opt_rf_dto[res_opt_rf_dto$threshold == opt_rf_dto$optimal_threshold,]
 
-pred_test_dto <- predict(rf, tree_test, type = "prob")[, "YES"]
+pred_test_dto <- predict(rf_dto, tree_test, type = "prob")[, "YES"]
 rf_class_dt_opt <- ifelse(pred_test_dto > opt_rf_dto$optimal_threshold, 1, 0)
 metrics_rf_dto <- calculate_metrics(rf_class_dt_opt, y_test_tree)
 metrics_rf_dto
 ```
+
+```{r}
+varImpPlot(rf_dto)
+```
+
 
 ## U/D Sampling
 
@@ -582,27 +587,29 @@ Thus pass numeric into glm but factor into
 
 ```{r}
 X_train_matrix <- as.data.frame(X_train)
-y_train_fac <- droplevels(as.factor(y_train))
+y_train_fac <- as.factor(Train_Data$convert)
 
 set.seed(123)
 train_up <- upSample(x = X_train_matrix, y = y_train_fac, yname = "convert")
 X_train_up <- data.matrix(subset(train_up, select = -convert))
-y_train_up <- as.numeric(as.character(train_up$convert))
+y_train_up <- as.numeric(train_up$convert)
 
 set.seed(123)
 train_down <- downSample(x = X_train_matrix, y = y_train_fac, yname = "convert")
 X_train_down <- data.matrix(subset(train_down, select = -convert))
-y_train_down <- as.numeric(as.character(train_down$convert))
+y_train_down <- as.numeric(train_down$convert)
 
 Train_Data_up <- Train_Data
 Train_Data_up$convert <- factor(Train_Data_up$convert, levels = c("NO","YES"))
 
+set.seed(123)
 up_train <- upSample(x = subset(Train_Data_up, select = -convert),
                      y = Train_Data_up$convert, yname = "convert")
 
 Train_Data_down <- Train_Data
 Train_Data_down$convert <- factor(Train_Data_down$convert, levels = c("NO","YES"))
 
+set.seed(123)
 down_train <- upSample(x = subset(Train_Data_down, select = -convert),
                      y = Train_Data_down$convert, yname = "convert")
 # prop table is just table but in proportions
@@ -626,15 +633,16 @@ y_train_inner_down <- as.numeric(as.character(train_down_inner$convert))
 Train_Data_inner_up <- Train_Data_inner
 Train_Data_inner_up$convert <- factor(Train_Data_inner_up$convert, levels = c("NO","YES"))
 
+set.seed(123)
 up_train_inner <- upSample(x = subset(Train_Data_inner_up, select = -convert),
                      y = Train_Data_inner_up$convert, yname = "convert")
 
 Train_Data_inner_down <- Train_Data_inner
 Train_Data_inner_down$convert <- factor(Train_Data_inner_down$convert, levels = c("NO","YES"))
 
+set.seed(123)
 down_train_inner <- upSample(x = subset(Train_Data_inner_down, select = -convert),
                      y = Train_Data_inner_down$convert, yname = "convert")
-
 ```
 
 
@@ -773,6 +781,7 @@ cv_enet_down_inner <- cv.glmnet(X_train_inner_down, y_train_inner_down,
 ```
 
 ```{r}
+set.seed(111)
 pred_glm_up_inner <- predict(glm_up_inner, newdata = Validation_Data, type = "response")
 pred_lasso_up_inner <- predict(cv_lasso_up_inner, newx = X_val, type = "response", s = "lambda.min")
 pred_ridge_up_inner <- predict(cv_ridge_up_inner, newx = X_val, type = "response", s = "lambda.min")
@@ -787,6 +796,7 @@ pred_enet_down_inner <- predict(cv_enet_down_inner,  newx = X_val, type = "respo
 
 ```{r}
 # up
+set.seed(111)
 opt_glm_up_inner <- optimise_threshold(pred_glm_up_inner,
                                        y_validation_glm, metric = "f1")
 opt_lasso_up_inner <- optimise_threshold(pred_lasso_up_inner, y_val, metric = "f1")
@@ -924,8 +934,7 @@ cat("Test error:", round(test_error, 3))
 # underfitting? maybe a discuss for next week.
 
 ```{r}
-library(MASS)
-step_model <- stepAIC(glm_basic, direction = "both", trace = FALSE)
+step_model <- stepAIC(glm_dt_opt, direction = "both", trace = FALSE)
 summary(step_model)
 formula(step_model)
 ```
@@ -941,3 +950,4 @@ To Do:
 -   loads of testing with different models, with different params, before and after box cox or z scaling
 
 -   loads of testing to do with hyperparams
+-   try rf with up/down sampling, check why rf with optimised decision threshold has such good performance.
