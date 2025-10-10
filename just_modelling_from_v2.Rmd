@@ -231,9 +231,8 @@ y_test <- y[-train_index]
 # length(y_val) / length(y)
 # length(y_test) / length(y)
 
-validation_index_df <- createDataPartition(Train_Data$convert, p = 0.25, list = FALSE)
-
 Train_Data <- df_modelling[train_index,]
+validation_index_df <- createDataPartition(Train_Data$convert, p = 0.25, list = FALSE)
 Validation_Data <- Train_Data[validation_index_df, ]
 Train_Data_inner<- Train_Data[-validation_index_df, ]
 Test_Data <- df_modelling[-train_index,]
@@ -327,7 +326,7 @@ calculate_metrics <- function(predictions, actual) {
     Precision = precision,
     Recall = recall,
     Specificity = specificity,
-    F1_Score = f1,
+    F1_Score = f1
   ))
 }
 
@@ -731,10 +730,10 @@ comparison_table <- data.frame(
 
 print(round(comparison_table, 4))
 
-glm_class_down <- ifelse(pred_glm_down > opt_glm$optimal_threshold, 1, 0)
-lasso_class_down <- ifelse(pred_lasso_down > opt_lasso$optimal_threshold, 1, 0)
-ridge_class_down <- ifelse(pred_ridge_down > opt_ridge$optimal_threshold, 1, 0)
-enet_class_down <- ifelse(pred_enet_down > opt_enet$optimal_threshold, 1, 0)
+glm_class_down <- ifelse(pred_glm_down > opt_glm_dt_opt$optimal_threshold, 1, 0)
+lasso_class_down <- ifelse(pred_lasso_down > opt_lasso_dt_opt$optimal_threshold, 1, 0)
+ridge_class_down <- ifelse(pred_ridge_down > opt_ridge_dt_opt$optimal_threshold, 1, 0)
+enet_class_down <- ifelse(pred_enet_down > opt_enet_dt_opt$optimal_threshold, 1, 0)
 
 metrics_glm_down <- calculate_metrics(glm_class_down, y_test_glm)
 metrics_lasso_down <- calculate_metrics(lasso_class_down, y_test)
