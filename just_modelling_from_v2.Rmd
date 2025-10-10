@@ -2,7 +2,9 @@
 title: "EDA_and_modelling_5oct"
 author: "Michael Wang"
 date: "`r Sys.Date()`"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -313,14 +315,13 @@ calculate_metrics <- function(predictions, actual) {
   tn <- sum(predictions == 0 & actual == 0)
   fp <- sum(predictions == 1 & actual == 0)
   fn <- sum(predictions == 0 & actual == 1)
-  
+
   accuracy <- (tp + tn) / (tp + tn + fp + fn)
   precision <- tp / (tp + fp)
   recall <- tp / (tp + fn)
-  sensitivity <- recall
   specificity <- tn / (tn + fp)
   f1 <- 2 * precision * recall / (precision + recall)
-  
+
   return(c(
     Accuracy = accuracy,
     Precision = precision,
