@@ -909,7 +909,7 @@ cv_lasso <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 1)
 train_preds <- predict(cv_lasso, newx = X_train, s = "lambda.min", type = "response")
 test_preds <- predict(cv_lasso, newx = X_test, s = "lambda.min", type = "response")
 
-opt_threshold <- opt_lasso$optimal_threshold
+opt_threshold <- opt_lasso_dt_opt$optimal_threshold
 train_class <- ifelse(train_preds > opt_threshold, 1, 0)
 test_class <- ifelse(test_preds > opt_threshold, 1, 0)
 
