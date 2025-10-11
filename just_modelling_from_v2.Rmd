@@ -256,29 +256,10 @@ cv_ridge <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 0)
 cv_enet <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 0.5)
 ```
 
-```{r}
+
 # # cv_lasso, etc. are cv.glmnet objects - running coef on them returns a sparse coeff matrix with one col of the
 # # fitted coeffecients, with intercept in first row. This is with the best lambda, stored in the cv.glmnet object.
-coef_lasso <- coef(cv_lasso, s = "lambda.min")
-# coef_ridge <- coef(cv_ridge, s = "lambda.min")
-# coef_enet <- coef(cv_enet, s = "lambda.min")
 
-# # this extracts that column of coeffecients, keeps only the non 0 ones, and keeps it as a matrix (drop = false to
-# prevent dropping into a vector); then returns top 20.
-lasso_nonzero <- coef_lasso[coef_lasso[,1] != 0, , drop = FALSE]
-sort(lasso_nonzero[,1], decreasing = TRUE)[1:20]
-
-# ridge_nonzero <- coef_ridge[coef_ridge[,1] != 0, , drop = FALSE]
-# sort(ridge_nonzero[,1], decreasing = TRUE)[1:20]
-
-# enet_nonzero <- coef_enet[coef_enet[,1] != 0, , drop = FALSE]
-# sort(enet_nonzero[,1], decreasing = TRUE)[1:20]
-
-# # cv error vs log(lambda)
-# plot(cv_lasso)
-# plot(cv_ridge)
-# plot(cv_enet)
-```
 
 ```{r}
 # type = response means to give probabilities for logistic reg instead of values for normal regression
@@ -405,7 +386,6 @@ pred_test <- predict(rf, tree_test, type = "prob")[, "YES"]
 pred_class <- ifelse(pred_test >= 0.5, 1, 0)
 rf_metrics <- calculate_metrics(pred_class, y_test_tree)
 
-# RUN THESE ONLY
 rf_metrics
 print(rf)
 varImpPlot(rf)
@@ -547,6 +527,60 @@ comparison_table <- data.frame(
 comparison_table
 
 ```
+
+```{r}
+
+```
+
+
+
+```{r}
+coef_lasso_dt_opt <- coef(cv_lasso_dt_opt, s = "lambda.min")
+coef_ridge_dt_opt <- coef(cv_ridge_dt_opt, s = "lambda.min")
+coef_enet_dt_opt <- coef(cv_enet_dt_opt, s = "lambda.min")
+coef_glm_dt_opt <- coef(glm_dt_opt)
+
+v <- drop(as.matrix(coef_lasso_dt_opt))
+v <- v[names(v) != "(Intercept)"]
+v_nz <- v[v != 0]
+idx <- order(abs(v_nz), decreasing = TRUE)
+top20 <- v_nz[idx][seq_len(min(20, length(idx)))]
+top20
+```
+
+```{r}
+v_ridge <- drop(as.matrix(coef_ridge_dt_opt))
+v_ridge <- v_ridge[names(v_ridge) != "(Intercept)"]
+v_ridge_nz <- v_ridge[v_ridge != 0]
+idx_ridge <- order(abs(v_ridge_nz), decreasing = TRUE)
+top20_ridge <- v_ridge_nz[idx_ridge][seq_len(min(20, length(idx_ridge)))]
+top20_ridge
+```
+ 
+```{r}
+v_enet <- drop(as.matrix(coef_enet_dt_opt))
+v_enet <- v_enet[names(v_enet) != "(Intercept)"]
+v_enet_nz <- v_enet[v_enet != 0]
+idx_enet <- order(abs(v_enet_nz), decreasing = TRUE)
+top20_enet <- v_enet_nz[idx_enet][seq_len(min(20, length(idx_enet)))]
+top20_enet
+```
+
+```{r}
+v_glm <- drop(as.matrix(coef_glm_dt_opt))
+v_glm <- v_glm[names(v_glm) != "(Intercept)"]
+v_glm_nz <- v_glm[v_glm != 0]
+idx_glm <- order(abs(v_glm_nz), decreasing = TRUE)
+top20_glm <- v_glm_nz[idx_glm][seq_len(min(20, length(idx_glm)))]
+top20_glm
+```
+
+
+
+```{r}
+summary(glm_dt_opt)
+```
+
 
 ## RF DTO
 
@@ -934,9 +968,9 @@ cat("Test error:", round(test_error, 3))
 # underfitting? maybe a discuss for next week.
 
 ```{r}
-step_model <- stepAIC(glm_dt_opt, direction = "both", trace = FALSE)
-summary(step_model)
-formula(step_model)
+# step_model <- stepAIC(glm_dt_opt, direction = "both", trace = FALSE)
+# summary(step_model)
+# formula(step_model)
 ```
 
 -   stratified samplied didn't do much, the original sampling was already relatively well split between train and test for the target variable.
