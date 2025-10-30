@@ -1,0 +1,1535 @@
+---
+title: "preliminary_modelling"
+output: html_document
+date: "2025-10-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(dplyr)
+```
+
+```{r}
+df <- read.csv("modelling_data.csv")
+```
+
+```{r}
+cols <- c(
+  "quote_price", "platform", "convert", "quote_date", "quote_time", "trip_start_month",
+  "trip_length", "lead_length", "num_travellers", "median_age", "group_type",
+  "Africa", "Europe", "Oceania", "Antarctica","North_America", "Central_America", "South_America", "Middle_East", "Central_Asia",
+  "South_East_Asia", "South_Asia", "East_Asia", "Multi_Region", "snowsports", 
+  "snowsports_length", "snowsports_strength", "adventure_activities_length", "adventure_activities_strength",
+  "cruise_cover_length", "cruise_cover_strength", "medical_conditions", "gadget_cover", "motorcycle_cover_length", "motorcycle_cover_strength",
+  "rental_vehicle_excess_length", "rental_vehicle_excess_strength",
+  "specified_items", "discount_category", "median_crime_index", "hdi_median", 
+  "extra_cancel_tier", "low_season", "medium_season", "high_season", 
+  "healthcare_index_median", "sent_mean", "is_summer", "is_autumn", "is_winter", 
+  "is_spring"
+)
+
+df <- df[, cols]
+
+df_selected <- df %>%
+  select(cols)
+
+df_selected <- df_selected %>%
+  mutate(
+    quote_date = as.Date(trimws(quote_date), format = "%d/%m/%Y")
+  )
+
+df_modelling <- df_selected %>%
+  mutate(across(where(is.character), as.factor))
+
+df_modelling[] <- lapply(df_modelling, function(x) {
+  if (is.character(x)) factor(x) else x
+})
+```
+
+```{r}
+#---------------------------
+# 1) Convert selected numeric columns to factors
+#---------------------------
+numerical_to_fact <- c(
+  "high_season", "medium_season", "low_season", "extra_cancel_tier",
+  "specified_items", "gadget_cover", "Africa", "Europe", "Oceania",
+  "Antarctica", "North_America", "Central_America", "South_America",
+  "Middle_East", "Central_Asia", "South_East_Asia", "South_Asia",
+  "East_Asia", "Multi_Region", "num_travellers"
+)
+
+df_modelling <- df_modelling %>%
+  mutate(across(all_of(numerical_to_fact), as.factor))
+
+#---------------------------
+# 2) Cap continuous variables
+#---------------------------
+cap_trip_len  <- quantile(df_modelling$trip_length, 0.99, na.rm = TRUE)
+cap_price     <- quantile(df_modelling$quote_price, 0.99, na.rm = TRUE)
+cap_lead_len  <- quantile(df_modelling$lead_length, 0.99, na.rm = TRUE)
+
+df_modelling$trip_length_capped  <- pmin(df_modelling$trip_length, cap_trip_len)
+df_modelling$quote_price_capped  <- pmin(df_modelling$quote_price, cap_price)
+df_modelling$lead_length_capped  <- pmin(df_modelling$lead_length, cap_lead_len)
+
+df_modelling <- df_modelling %>%
+  select(-trip_length, -quote_price, -lead_length)
+
+# --- keep an untouched copy BEFORE scaling ---
+df_modelling_raw <- df_modelling   # exact raw, will keep all original scaling
+
+# --- do scaling on a working copy ---
+df_z_work <- df_modelling_raw
+
+#---------------------------
+# 3) Z-standardize selected numeric columns
+#---------------------------
+z_cols <- c(
+  "sent_mean", "healthcare_index_median", "hdi_median", "median_crime_index",
+  "rental_vehicle_excess_length", "motorcycle_cover_length", "cruise_cover_length",
+  "adventure_activities_length", "snowsports_length", "median_age",
+  "trip_length_capped", "quote_price_capped", "lead_length_capped"
+)
+
+small <- 1e-6
+for (col in z_cols) {
+  if (min(df_modelling[[col]], na.rm = TRUE) <= 0) {
+    df_modelling[[col]] <- df_modelling[[col]] + small
+  }
+}
+
+X_z_df <- df_modelling[, z_cols]
+preprocess_z <- preProcess(X_z_df, method = c("center", "scale"))
+X_z <- predict(preprocess_z, X_z_df)
+
+df_modelling[paste0(z_cols, "_z")] <- X_z
+df_modelling_z <- df_modelling %>% select(-all_of(z_cols))
+```
+
+### Train/Test/Val
+
+```{r}
+y <- ifelse(df_modelling_z$convert == "YES", 1, 0)
+
+set.seed(111)
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+
+Train_Data_z <- df_modelling_z[train_index, ]
+Test_Data_z  <- df_modelling_z[-train_index, ]
+
+X_train_z <- model.matrix(convert ~ ., Train_Data_z)
+X_test_z  <- model.matrix(convert ~ ., Test_Data_z)
+
+y_train_z <- ifelse(Train_Data_z$convert == "YES", 1, 0)
+y_test_z  <- ifelse(Test_Data_z$convert == "YES", 1, 0)
+
+# Validation split
+validation_index_z <- createDataPartition(y_train_z, p = 0.25, list = FALSE)
+
+X_val_z <- X_train_z[validation_index_z, ]
+y_val_z <- y_train_z[validation_index_z]
+
+X_train_inner <- X_train_z[-validation_index_z, ]
+y_train_inner <- y_train_z[-validation_index_z]
+```
+
+### GLM/Shrinkage
+
+```{r}
+glm_basic <- glm(convert ~ ., data = Train_Data_z, family = binomial)
+summary(glm_basic)
+```
+
+```{r}
+cv_lasso <- cv.glmnet(X_train_inner, y_train_inner, family="binomial", alpha=1)
+cv_ridge <- cv.glmnet(X_train_inner, y_train_inner, family="binomial", alpha=0)
+cv_enet  <- cv.glmnet(X_train_inner, y_train_inner, family="binomial", alpha=0.5)
+```
+
+```{r}
+# # cv_lasso, etc. are cv.glmnet objects - running coef on them returns a sparse coeff matrix with one col of the
+# # fitted coeffecients, with intercept in first row. This is with the best lambda, stored in the cv.glmnet object.
+coef_lasso <- coef(cv_lasso, s = "lambda.min")
+coef_ridge <- coef(cv_ridge, s = "lambda.min")
+coef_enet <- coef(cv_enet, s = "lambda.min")
+
+# # this extracts that column of coeffecients, keeps only the non 0 ones, and keeps it as a matrix (drop = false to
+# prevent dropping into a vector); then returns top 20.
+lasso_nonzero <- coef_lasso[coef_lasso[,1] != 0, , drop = FALSE]
+sort(lasso_nonzero[,1], decreasing = TRUE)[1:20]
+
+ridge_nonzero <- coef_ridge[coef_ridge[,1] != 0, , drop = FALSE]
+sort(ridge_nonzero[,1], decreasing = TRUE)[1:20]
+
+enet_nonzero <- coef_enet[coef_enet[,1] != 0, , drop = FALSE]
+sort(enet_nonzero[,1], decreasing = TRUE)[1:20]
+
+## ---- LASSO ----
+lasso_nonzero <- coef_lasso[coef_lasso[,1] != 0, , drop = FALSE]
+idx_lasso <- order(abs(lasso_nonzero[,1]), decreasing = TRUE)
+lasso_top <- lasso_nonzero[idx_lasso, , drop = FALSE][1:20, , drop = FALSE]
+lasso_top
+
+## ---- RIDGE ----
+ridge_nonzero <- coef_ridge[coef_ridge[,1] != 0, , drop = FALSE]
+idx_ridge <- order(abs(ridge_nonzero[,1]), decreasing = TRUE)
+ridge_top <- ridge_nonzero[idx_ridge, , drop = FALSE][1:20, , drop = FALSE]
+ridge_top
+
+## ---- ELASTIC NET ----
+enet_nonzero <- coef_enet[coef_enet[,1] != 0, , drop = FALSE]
+idx_enet <- order(abs(enet_nonzero[,1]), decreasing = TRUE)
+enet_top <- enet_nonzero[idx_enet, , drop = FALSE][1:20, , drop = FALSE]
+enet_top
+
+# # cv error vs log(lambda)
+plot(cv_lasso)
+plot(cv_ridge)
+plot(cv_enet)
+```
+
+```{r}
+# type = response means to give probabilities for logistic reg instead of values for normal regression
+# predict() as a universal apply data to model base r function
+
+# idea of using dataframe for glm prediction and matrix for shrinkage prediction i think is because of the code inside
+# the glm model saw the original data, so it was the test data in the same form to help process. The shrinkage never
+# saw the dataframe only a matrix rep, so thus it wants it in the same format.
+
+# Predictions
+pred_glm   <- predict(glm_basic, newdata = Test_Data_z, type = "response")
+pred_lasso <- predict(cv_lasso, newx = X_test_z, type = "response", s = "lambda.min")
+pred_ridge <- predict(cv_ridge, newx = X_test_z, type = "response", s = "lambda.min")
+pred_enet  <- predict(cv_enet,  newx = X_test_z, type = "response", s = "lambda.min")
+
+# Classifications
+glm_class   <- ifelse(pred_glm   > 0.5, 1, 0)
+lasso_class <- ifelse(pred_lasso > 0.5, 1, 0)
+ridge_class <- ifelse(pred_ridge > 0.5, 1, 0)
+enet_class  <- ifelse(pred_enet  > 0.5, 1, 0)
+
+# Accuracy (use the SAME y_test for all)
+acc_glm   <- mean(glm_class   == y_test_z)
+acc_lasso <- mean(lasso_class == y_test_z)
+acc_ridge <- mean(ridge_class == y_test_z)
+acc_enet  <- mean(enet_class  == y_test_z)
+
+c(glm = acc_glm, Lasso = acc_lasso, Ridge = acc_ridge, ElasticNet = acc_enet)
+```
+
+```{r}
+calculate_metrics <- function(predictions, actual) {
+  tp <- sum(predictions == 1 & actual == 1)
+  tn <- sum(predictions == 0 & actual == 0)
+  fp <- sum(predictions == 1 & actual == 0)
+  fn <- sum(predictions == 0 & actual == 1)
+  
+  accuracy <- (tp + tn) / (tp + tn + fp + fn)
+  precision <- tp / (tp + fp)
+  recall <- tp / (tp + fn)
+  specificity <- tn / (tn + fp)
+  f1 <- 2 * precision * recall / (precision + recall)
+  
+  return(c(
+    Accuracy = accuracy,
+    Precision = precision,
+    Recall = recall,
+    Specificity = specificity,
+    F1_Score = f1
+  ))
+}
+
+metrics_glm   <- calculate_metrics(glm_class,   y_test_z)
+metrics_lasso <- calculate_metrics(lasso_class, y_test_z)
+metrics_ridge <- calculate_metrics(ridge_class, y_test_z)
+metrics_enet  <- calculate_metrics(enet_class,  y_test_z)
+
+comparison_table <- data.frame(
+  GLM        = metrics_glm,
+  Lasso      = metrics_lasso,
+  Ridge      = metrics_ridge,
+  ElasticNet = metrics_enet
+)
+
+print(round(comparison_table, 4))
+```
+
+```{r}
+library(pROC)
+roc_glm <- roc(y_test_z, as.vector(pred_glm))
+roc_lasso <- roc(y_test_z, as.vector(pred_lasso))
+roc_ridge <- roc(y_test_z, as.vector(pred_ridge))
+roc_enet <- roc(y_test_z, as.vector(pred_enet))
+
+auc(roc_glm)
+auc(roc_lasso)
+auc(roc_ridge)
+auc(roc_enet)
+```
+
+LASSO for more interpretability (feature selection)
+
+ENET for slightly more stable coeffecients
+
+HORRENDOUS F1 SCORE when not treating any imbalanced data stuff.
+
+## RF
+
+```{r}
+df_tree_modelling <- df_modelling 
+```
+
+```{r}
+set.seed(111)
+df_tree_modelling$convert <- factor(df_tree_modelling$convert, , levels = c("NO","YES"))
+
+y_tree <- df_tree_modelling$convert
+train_index <- createDataPartition(y_tree, p = 0.8, list = FALSE)
+
+y_train_tree <- y[train_index]
+validation_index <- createDataPartition(y_train_tree, p = 0.25, list = FALSE)
+
+tree_train <- df_tree_modelling[train_index, ]
+tree_train_inner <- df_tree_modelling[-validation_index, ]
+tree_val <- tree_train[validation_index, ]
+tree_test <- df_tree_modelling[-train_index, ]
+y_val_tree <- as.numeric(ifelse(tree_val$convert == "YES", 1, 0))
+y_test_tree <- as.numeric(ifelse(tree_test$convert == "YES", 1, 0))
+
+set.seed(222)
+rf <- randomForest(
+  convert ~ .,
+  data = tree_train,
+  ntree = 500,
+  mtry = floor(sqrt(ncol(tree_train) - 1)),
+  importance = TRUE
+)
+
+# type = prob returns probabilities instead of class labels. This is for several reasons,
+# first is calculating metrics like ROC or just probability in general, and second for
+# later decision threshold tuning. [, "YES"] means we select the YES probability column.
+pred_test <- predict(rf, tree_test, type = "prob")[, "YES"]
+pred_class <- ifelse(pred_test >= 0.5, 1, 0)
+rf_metrics <- calculate_metrics(pred_class, y_test_tree)
+
+ #Accuracy   Precision      Recall Specificity    F1_Score 
+  #0.8713367   0.4982270   0.1562848   0.9767881   0.2379340 
+
+
+
+# RUN THESE ONLY
+
+library(PRROC)
+library(caret)
+
+# true labels (numeric 0/1)
+y_true <- y_test_tree
+p      <- pred_test      # already prob of YES
+yhat   <- pred_class     # already 0/1 from threshold 0.5
+
+# ---- CONFUSION MATRIX PARTS ----
+cm <- confusionMatrix(factor(yhat), factor(y_true), positive = "1")
+
+acc  <- cm$overall["Accuracy"]
+sens <- cm$byClass["Sensitivity"]   # Recall / TPR
+spec <- cm$byClass["Specificity"]   # TNR
+prec <- cm$byClass["Precision"]     # PPV
+f1   <- cm$byClass["F1"]
+
+# ---- AUC (with POS = 1 = YES) ----
+auc <- roc.curve(
+  scores.class0 = p[y_true==1],   # positives
+  scores.class1 = p[y_true==0],   # negatives
+  curve = FALSE
+)$auc
+
+# ---- PRINT CLEAN ----
+cat("\nRANDOM FOREST PERFORMANCE\n")
+cat("Accuracy     :", round(acc, 4), "\n")
+cat("Sensitivity  :", round(sens, 4), "\n")
+cat("Specificity  :", round(spec, 4), "\n")
+cat("Precision    :", round(prec, 4), "\n")
+cat("F1 Score     :", round(f1, 4), "\n")
+cat("AUC          :", round(auc, 4), "\n")
+
+rf_metrics
+print(rf)
+varImpPlot(rf)
+```
+
+![](images/clipboard-3849658150.png)
+
+![](images/clipboard-2847254901.png)
+
+### Train/Test/Val Raw Dataset
+
+```{r}
+#-------------------------------#
+# Use df_modelling (no _z, no raw clone)
+#-------------------------------#
+
+y <- ifelse(df_modelling$convert == "YES", 1, 0)
+
+set.seed(111)
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+
+Train_Data <- df_modelling[train_index, ]
+Test_Data  <- df_modelling[-train_index, ]
+
+X_train <- model.matrix(convert ~ ., Train_Data)
+X_test  <- model.matrix(convert ~ ., Test_Data)
+
+y_train <- ifelse(Train_Data$convert == "YES", 1, 0)
+y_test  <- ifelse(Test_Data$convert == "YES", 1, 0)
+
+# Validation split from TRAIN (25% of train = 20% overall)
+validation_index <- createDataPartition(y_train, p = 0.25, list = FALSE)
+
+X_val <- X_train[validation_index, ]
+y_val <- y_train[validation_index]
+
+X_train_inner <- X_train[-validation_index, ]
+y_train_inner <- y_train[-validation_index]
+```
+
+grid search for hyperparameter tuning
+
+imbalanced data as well - cohens
+
+```{r}
+sub_idx <- sample(nrow(Train_Data), size = floor(0.5*nrow(Train_Data))) 
+train_sub <- Train_Data[sub_idx,]
+
+parameters_2 <- expand.grid(n.trees = (1:30)*50,
+                          interaction.depth = c(1, 2, 3), 
+                          shrinkage = c(0.01, 0.05, 0.1),
+                          n.minobsinnode = c(10))
+                          
+set.seed(629)
+
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+gbm_gridfit2 <- train(
+  convert ~ .,                     # formula
+  data = train_sub,
+  method = "gbm",
+  distribution = "bernoulli",
+  metric = "ROC",                  # optimize by AUC
+  trControl = ctrl,
+  tuneGrid = parameters_2,
+  verbose = FALSE,    
+)
+
+stopCluster(cl)
+
+print(gbm_gridfit2)
+plot(gbm_gridfit2)
+print(gbm_gridfit2$bestTune)
+
+#Results for 10% subset
+   #n.trees interaction.depth shrinkage n.minobsinnode
+#88    1400                 3      0.01             10
+
+#Results for 30% subset
+#     n.trees interaction.depth shrinkage n.minobsinnode
+#165     750                 3      0.05             10
+#Results for 50% subset
+#   n.trees interaction.depth shrinkage n.minobsinnode
+#166     800                 3      0.05             10
+```
+
+### GBM Using GBM Package
+
+```{r}
+library(gbm)
+
+convert2 <- df_modelling %>%
+  mutate(
+    across(where(is.character), as.factor),
+    across(where(is.logical), as.factor),
+    quote_date = as.numeric(quote_date)
+  ) %>%
+  mutate(
+    convert_numeric = ifelse(convert == "YES", 1, 0)
+  ) %>%
+  mutate(
+    convert = NULL
+  ) %>%
+  mutate(rand_int = sample(1:100, n(), replace = TRUE))
+
+train2 <- convert2[train_index, ]; test2 <- convert2[-train_index, ]
+
+```
+
+```{r}
+hyper_grid <- expand.grid(shrinkage = c(0.01),
+                          interaction.depth = c(1, 3, 5),
+                          n.minobsinnode = c(5, 10, 15),
+                          bag.fraction = c(0.8, 1),
+                          optimal_trees = 0, # a place to dump results
+                          min_error = 0 # a place to dump results
+)
+
+nrow(hyper_grid)
+# grid search
+for(i in 1:nrow(hyper_grid)) {
+  # reproducibility
+  set.seed(123)
+  # train model
+  gbm.tune <- gbm(
+    formula = convert_numeric ~ .,
+    distribution = "bernoulli",
+    data = train2,
+    n.trees = 2000,
+    interaction.depth = hyper_grid$interaction.depth[i],
+    shrinkage = hyper_grid$shrinkage[i],
+    n.minobsinnode = hyper_grid$n.minobsinnode[i],
+    bag.fraction = hyper_grid$bag.fraction[i],
+    cv.folds = 5,
+    n.cores = NULL, # will use all cores by default
+    verbose = FALSE
+)
+# add min training error and trees to grid
+  hyper_grid$optimal_trees[i] <- which.min(gbm.tune$cv.error)
+  hyper_grid$min_error[i] <- sqrt(min(gbm.tune$cv.error))
+}
+
+hyper_grid %>%
+  dplyr::arrange(min_error) %>%
+  head(10)
+```
+
+```{r}
+set.seed(456)
+gbm2_best <- gbm(
+  formula = convert_numeric ~ .,
+  distribution = "bernoulli",
+  data = train2,
+  n.trees = 2000,
+  interaction.depth = 5,
+  shrinkage = 0.01,
+  n.minobsinnode = 15,
+  bag.fraction = 0.8,
+  train.fraction = 1,
+  n.cores = NULL, # will use all cores by default
+  verbose = FALSE
+)
+
+gbm2_best_probpred <- predict(
+  gbm2_best,
+  newdata = subset(test2, select = -convert_numeric),
+  type   = "response"
+)
+
+library(PRROC)
+
+gbm2_best_probpred_flipped <- 1 - gbm2_best_probpred
+
+scores_neg <- gbm2_best_probpred_flipped[test2$convert_numeric == 0]
+scores_pos <- gbm2_best_probpred_flipped[test2$convert_numeric == 1]
+
+gbm2_best_auc <- roc.curve(scores.class0 = scores_neg,
+                           scores.class1 = scores_pos,
+                           curve = TRUE)
+gbm2_best_auc$auc
+
+# auc 0.8234033
+```
+
+```{r}
+library(PRROC)
+library(caret)
+library(MLmetrics)
+
+y_true <- test2$convert_numeric   # 0/1
+p <- gbm2_best_probpred_flipped   # already flipped and aligned
+
+# choose a threshold
+thr <- 0.5
+y_pred <- as.integer(p >= thr)
+
+# ---- BASIC METRICS ----
+acc   <- mean(y_pred == y_true)
+sens  <- Recall(y_pred, y_true)        # TPR
+spec  <- Specificity(y_pred, y_true)   # TNR
+prec  <- Precision(y_pred, y_true)
+f1    <- F1_Score(y_pred, y_true)
+ba    <- (sens + spec)/2               # balanced accuracy
+
+# ---- PR AUC ----
+pr <- pr.curve(scores.class0 = p[y_true==1],
+               scores.class1 = p[y_true==0],
+               curve=FALSE)$auc.integral
+
+# ---- KS ----
+ord <- order(p, decreasing=TRUE)
+tpr <- cumsum(y_true[ord]==1)/sum(y_true==1)
+fpr <- cumsum(y_true[ord]==0)/sum(y_true==0)
+ks  <- max(abs(tpr-fpr))
+
+# ---- OUTPUT SUMMARY ----
+cat("\nMETRICS @ thr = ",thr,"\n",
+    "ACC  =",acc,"\n",
+    "SENS =",sens,"\n",
+    "SPEC =",spec,"\n",
+    "PREC =",prec,"\n",
+    "F1   =",f1,"\n",
+    "BAL_ACC =",ba,"\n",
+    "PR_AUC =",pr,"\n")
+
+#recall
+
+#$AUC
+#[1] 0.8234033
+
+#$ACC
+#[1] 0.8844174
+
+#$SENS
+#[1] 0.1865973
+
+#$SPEC
+#[1] 0.9829513
+
+#$PREC
+#[1] 0.6071429
+
+#$F1
+#[1] 0.2854618
+```
+
+### GBM Post Weights - Michael's Code
+
+```{r}
+library(dplyr)
+library(gbm)
+library(caret)
+library(pROC)
+
+#===============================
+# 1) SELECT & CLEAN
+#===============================
+df_selected <- df_modelling %>%
+  mutate(
+    across(where(is.character), as.factor),
+    across(where(is.logical), as.factor),
+    quote_date = as.numeric(quote_date)
+  ) %>%
+  mutate(
+    convert_numeric = ifelse(convert == "YES", 1, 0)
+  ) %>%
+  mutate(
+    convert = NULL
+  ) %>%
+  mutate(rand_int = sample(1:100, n(), replace = TRUE))
+
+set.seed(42)
+df_selected <- df_selected %>%
+  mutate(rand_noise = runif(n()))
+
+#===============================
+# 2) TARGET CREATION
+#===============================
+df_convert <- df_selected %>%
+  mutate(boost_chosen = convert_numeric)   # target = convert_numeric (0/1)
+
+# remove any leakage columns (if applicable)
+leak_cols <- c("convert_numeric")          # only if you want to exclude raw numeric
+df_model_convert <- df_convert %>%
+  select(-all_of(leak_cols))
+
+df_gbm_convert <- df_model_convert
+
+#===============================
+# 3) TRAIN / TEST SPLIT
+#===============================
+set.seed(45)
+index_gbm <- createDataPartition(df_gbm_convert$boost_chosen, p = 0.8, list = FALSE)
+Train_Data_gbm_convert <- df_gbm_convert[index_gbm, ]
+Test_Data_gbm_convert  <- df_gbm_convert[-index_gbm, ]
+
+#===============================
+# 4) CLASS WEIGHTS
+#===============================
+set.seed(456)
+pos_w <- sum(Train_Data_gbm_convert$boost_chosen == 0) /
+         sum(Train_Data_gbm_convert$boost_chosen == 1)
+
+w_convert <- ifelse(Train_Data_gbm_convert$boost_chosen == 1, pos_w, 1)
+
+#===============================
+# 5) TRAIN GBM MODEL
+#===============================
+gbm_best_convert <- gbm(
+  formula = boost_chosen ~ .,
+  data = Train_Data_gbm_convert,
+  n.trees = 2000,
+  interaction.depth = 7,
+  shrinkage = 0.01,
+  n.minobsinnode = 15,
+  bag.fraction = 0.8,
+  train.fraction = 1,
+  weights = w_convert,
+  distribution = "bernoulli",
+  n.cores = NULL,
+  verbose = FALSE
+)
+
+#===============================
+# 6) PREDICT + EVALUATE
+#===============================
+X_test <- Test_Data_gbm_convert %>% select(-boost_chosen)
+
+gbm_best_probpred_convert <- predict(
+  gbm_best_convert,
+  newdata = X_test,
+  type = "response"
+)
+
+roc_obj <- roc(
+  response = Test_Data_gbm_convert$boost_chosen,
+  predictor = gbm_best_probpred_convert,
+  levels = c(0,1)
+)
+cat("AUC =", pROC::auc(roc_obj), "\n")
+
+# Confusion Matrix @ 0.5
+gbm_best_class <- factor(
+  ifelse(gbm_best_probpred_convert >= 0.5, "YES", "NO"),
+  levels = c("NO", "YES")
+)
+
+test_conf_matrix <- Test_Data_gbm_convert
+test_conf_matrix$boost_chosen <- factor(
+  ifelse(test_conf_matrix$boost_chosen == 1, "YES", "NO"),
+  levels = c("NO", "YES")
+)
+
+cm <- confusionMatrix(
+  data = gbm_best_class,
+  reference = test_conf_matrix$boost_chosen,
+  positive = "YES"
+)
+cm
+```
+
+### GBM with weights results
+
+```{r}
+#===============================
+# 7) ROC CURVE
+#===============================
+plot.roc(
+  roc_obj,
+  main = "ROC Curve - GBM Model",
+  col = "#2E6B5B",
+  lwd = 3,
+  grid = TRUE
+)
+abline(a = 0, b = 1, lty = 2, col = "grey")
+auc_value <- auc(roc_obj)
+cat("AUC =", auc_value, "\n")
+
+#===============================
+# 8) KS STATISTIC
+#===============================
+# KS = max difference between TPR and FPR
+roc_df <- data.frame(
+  TPR = roc_obj$sensitivities,
+  FPR = 1 - roc_obj$specificities
+)
+ks_stat <- max(roc_df$TPR - roc_df$FPR)
+cat("KS Statistic =", ks_stat, "\n")
+
+#===============================
+# 9) LIFT CHART
+#===============================
+library(ggplot2)
+
+lift_data <- data.frame(
+  prob = gbm_best_probpred_convert,
+  actual = Test_Data_gbm_convert$boost_chosen
+)
+
+# Bin by decile
+lift_data <- lift_data %>%
+  mutate(
+    decile = ntile(prob, 10)
+  ) %>%
+  group_by(decile) %>%
+  summarise(
+    total = n(),
+    responders = sum(actual)
+  ) %>%
+  mutate(
+    response_rate = responders / total,
+    cum_response = cumsum(responders) / sum(responders),
+    lift = response_rate / (sum(responders) / sum(total))
+  )
+
+ggplot(lift_data, aes(x = decile, y = lift)) +
+  geom_bar(stat = "identity", fill = "#2E6B5B") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+  labs(
+    title = "Lift Chart - GBM Model",
+    x = "Decile (1 = Lowest Probability, 10 = Highest)",
+    y = "Lift over Random"
+  ) +
+  theme_minimal()
+
+#===============================
+# 10) VARIABLE IMPORTANCE
+#===============================
+var_imp <- summary(gbm_best_convert, plotit = FALSE)
+top_vars <- head(var_imp, 30)
+cat("\nTop 10 Variables by Relative Influence:\n")
+print(top_vars)
+
+# Optional: plot variable importance
+ggplot(top_vars, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_bar(stat = "identity", fill = "#2E6B5B") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Variables by Relative Influence",
+    x = "Variable",
+    y = "Relative Influence (%)"
+  ) +
+  theme_minimal()
+
+#===============================
+# 11) GINI COEFFICIENT
+#===============================
+# Gini = 2*AUC - 1
+gini_value <- 2 * auc_value - 1
+cat("Gini Coefficient =", gini_value, "\n")
+
+#===============================
+# 12) SUMMARY OUTPUT
+#===============================
+cat("\n=== MODEL PERFORMANCE SUMMARY ===\n")
+cat("AUC: ", round(auc_value, 4), "\n")
+cat("Gini: ", round(gini_value, 4), "\n")
+cat("KS: ", round(ks_stat, 4), "\n")
+cat("Accuracy: ", round(cm$overall['Accuracy'], 4), "\n")
+cat("Sensitivity: ", round(cm$byClass['Sensitivity'], 4), "\n")
+cat("Specificity: ", round(cm$byClass['Specificity'], 4), "\n")
+cat("F1: ", round(cm$byClass['F1'], 4), "\n")
+```
+
+### xgBoost
+
+```{r}
+# =========================
+# LIBS
+# =========================
+library(Matrix)
+library(xgboost)
+library(caret)     # for stratified split
+library(PRROC)
+library(data.table)
+
+set.seed(2025)
+
+# =========================
+# 1) DATA: 1-hot encode (sparse) + target
+# =========================
+df <- df_modelling
+df$convert <- factor(df$convert, levels = c("NO","YES"))
+y <- as.integer(df$convert == "YES")                   # 0/1
+X <- Matrix::sparse.model.matrix(convert ~ . - 1, df)  # sparse 1-hot, no intercept
+
+# =========================
+# 2) Stratified Train/Val/Test = 70/15/15
+# =========================
+idx_train <- createDataPartition(y, p = 0.70, list = FALSE)
+X_train <- X[idx_train, ];      y_train <- y[idx_train]
+X_rem   <- X[-idx_train, ];     y_rem   <- y[-idx_train]
+
+idx_val <- createDataPartition(y_rem, p = 0.50, list = FALSE)
+X_val  <- X_rem[idx_val, ];     y_val  <- y_rem[idx_val]
+X_test <- X_rem[-idx_val, ];    y_test <- y_rem[-idx_val]
+
+# DMatrix
+dtrain_full <- xgb.DMatrix(X_train, label = y_train)
+dval        <- xgb.DMatrix(X_val,   label = y_val)
+dtest       <- xgb.DMatrix(X_test,  label = y_test)
+
+# =========================
+# 3) Class imbalance weight on TRAIN
+#    scale_pos_weight = neg/pos
+# =========================
+pos <- sum(y_train == 1); neg <- sum(y_train == 0)
+spw <- if (pos > 0) neg/pos else 1
+
+# =========================
+# 4) FAST TUNING on TRAIN SUBSET + Early Stopping
+#    (reduces time massively; keep VAL full to rank)
+# =========================
+sub_idx     <- sample(seq_len(nrow(X_train)), size = max(1000, floor(0.25*nrow(X_train))))
+dtrain_sub  <- xgb.DMatrix(X_train[sub_idx,], label = y_train[sub_idx])
+
+grid <- CJ(
+  eta = c(0.05, 0.10),
+  max_depth = c(3, 5),
+  subsample = c(0.8),
+  colsample_bytree = c(0.8)
+)
+
+watch <- list(train = dtrain_sub, val = dval)
+
+best <- list(score = -Inf, param = NULL, nrounds = NULL)
+
+for (i in seq_len(nrow(grid))) {
+  p <- as.list(grid[i])
+
+  params <- list(
+    booster = "gbtree",
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = p$eta,
+    max_depth = p$max_depth,
+    subsample = p$subsample,
+    colsample_bytree = p$colsample_bytree,
+    scale_pos_weight = spw,
+    nthread = max(1, parallel::detectCores() - 1),
+    verbosity = 0
+  )
+
+  fit <- xgb.train(
+    params = params,
+    data = dtrain_sub,
+    nrounds = 1500,                # lower cap; ES will stop earlier
+    watchlist = watch,
+    early_stopping_rounds = 50,
+    maximize = TRUE,
+    verbose = 0
+  )
+
+  if (!is.null(fit$best_score) && fit$best_score > best$score) {
+    best$score   <- fit$best_score
+    best$param   <- params
+    best$nrounds <- fit$best_iteration
+  }
+}
+
+cat(sprintf("\nBest VAL AUC (subset tuning) = %.4f at %d rounds\n",
+            best$score, best$nrounds))
+print(best$param)
+
+# =========================
+# 5) RETRAIN once on FULL TRAIN with best params/rounds
+# =========================
+final_fit <- xgb.train(
+  params  = best$param,
+  data    = dtrain_full,
+  nrounds = best$nrounds,
+  verbose = 0
+)
+
+# =========================
+# 6) Threshold selection on VAL (maximize F1)
+# =========================
+pred_val <- predict(final_fit, dval, ntreelimit = best$nrounds)
+
+f1_at <- function(p, y, thr) {
+  yhat <- as.integer(p >= thr)
+  tp <- sum(yhat==1 & y==1); fp <- sum(yhat==1 & y==0)
+  fn <- sum(yhat==0 & y==1)
+  precision <- if ((tp+fp)==0) 0 else tp/(tp+fp)
+  recall    <- if ((tp+fn)==0) 0 else tp/(tp+fn)
+  if (precision + recall == 0) return(0)
+  2*precision*recall/(precision+recall)
+}
+
+ths <- seq(0.02, 0.98, by = 0.02)
+f1s <- vapply(ths, function(t) f1_at(pred_val, y_val, t), numeric(1))
+best_thr <- ths[which.max(f1s)]
+cat(sprintf("Chosen threshold (max F1 on VAL): %.2f  |  F1=%.3f\n",
+            best_thr, max(f1s)))
+
+# =========================
+# 7) Final evaluation on TEST
+# =========================
+pred_test <- predict(final_fit, dtest, ntreelimit = best$nrounds)
+
+# ROC AUC (treat POS scores as class0 per PRROC convention here)
+scores_pos <- pred_test[y_test == 1]
+scores_neg <- pred_test[y_test == 0]
+roc_auc <- roc.curve(scores.class0 = scores_pos, scores.class1 = scores_neg, curve = FALSE)$auc
+
+# PR AUC
+pr_auc <- pr.curve(scores.class0 = scores_pos, scores.class1 = scores_neg, curve = FALSE)$auc.integral
+
+# Confusion Matrix & F1 on TEST
+yhat_test <- as.integer(pred_test >= best_thr)
+tp <- sum(yhat_test==1 & y_test==1)
+tn <- sum(yhat_test==0 & y_test==0)
+fp <- sum(yhat_test==1 & y_test==0)
+fn <- sum(yhat_test==0 & y_test==1)
+
+precision <- if ((tp+fp)==0) 0 else tp/(tp+fp)
+recall    <- if ((tp+fn)==0) 0 else tp/(tp+fn)
+f1_test   <- if (precision+recall==0) 0 else 2*precision*recall/(precision+recall)
+
+conf_mat <- matrix(c(tn, fp, fn, tp), nrow=2, byrow=TRUE,
+                   dimnames=list("Actual"=c("0","1"), "Pred"=c("0","1")))
+
+# KS
+ord <- order(pred_test, decreasing = TRUE)
+y_sorted <- y_test[ord]
+tpr <- cumsum(y_sorted==1)/sum(y_sorted==1)
+fpr <- cumsum(y_sorted==0)/sum(y_sorted==0)
+ks  <- max(abs(tpr - fpr))
+
+cat(sprintf("\nTEST Metrics:\n ROC-AUC: %.4f\n PR-AUC:  %.4f\n F1:      %.4f\n KS:      %.4f\n",
+            roc_auc, pr_auc, f1_test, ks))
+print(conf_mat)
+
+# =========================
+# 8) Feature Importance (Gain)
+# =========================
+feat_names <- colnames(X)
+imp <- xgb.importance(model = final_fit, feature_names = feat_names)
+head(imp, 15)  # top features (table)
+# Optional: xgb.plot.importance(imp, top_n = 20)
+
+# =========================
+# 9) SHAP (TreeSHAP) summary (TEST)
+# =========================
+shap_contrib <- predict(final_fit, dtest, ntreelimit = best$nrounds, predcontrib = TRUE)
+shap_contrib <- shap_contrib[, -ncol(shap_contrib), drop = FALSE]  # drop bias
+shap_mean_abs <- colMeans(abs(shap_contrib))
+shap_rank <- sort(shap_mean_abs, decreasing = TRUE)
+head(shap_rank, 15)
+
+# Optional plot:
+# xgboost::xgb.plot.shap(data = as.matrix(X_test), model = final_fit, top_n = 20)
+
+#TEST Metrics:
+ #ROC-AUC: 0.8324
+ #PR-AUC:  0.4477
+ #F1:      0.4653
+ #KS:      0.4967
+#> print(conf_mat)
+ #     Pred
+#Actual    0    1
+#     0 7883 1251
+#     1  567  791
+```
+
+### xGBoost with weights
+
+```{r}
+#===============================
+# XGBOOST MODEL (WITH WEIGHTS)
+#===============================
+library(xgboost)
+library(dplyr)
+library(PRROC)
+library(MLmetrics)
+library(caret)
+
+df_xgb_convert <- df_gbm_convert  # rename for clarity
+
+# Ensure target is numeric 0/1
+df_xgb_convert$boost_chosen <- as.numeric(df_xgb_convert$boost_chosen)
+
+# Stratified 80/20 split
+train_idx <- createDataPartition(df_xgb_convert$boost_chosen, p = 0.8, list = FALSE)
+train_df <- df_xgb_convert[train_idx, ]
+test_df  <- df_xgb_convert[-train_idx, ]
+
+# Design matrices
+X_train <- model.matrix(boost_chosen ~ ., train_df)[, -1]
+y_train <- train_df$boost_chosen
+X_test  <- model.matrix(boost_chosen ~ ., test_df)[, -1]
+y_test  <- test_df$boost_chosen
+
+# Compute class imbalance ratio
+pos_w <- sum(y_train == 0) / sum(y_train == 1)
+
+# Create DMatrix
+dtrain <- xgb.DMatrix(X_train, label = y_train)
+dtest  <- xgb.DMatrix(X_test, label = y_test)
+
+#--------------------------------------------------
+# 2) Parameter Grid + Cross-Validation
+#--------------------------------------------------
+xgb_grid <- expand.grid(
+  eta = c(0.01, 0.05),
+  max_depth = c(4, 6),
+  min_child_weight = c(5, 10),
+  subsample = c(0.8),
+  colsample_bytree = c(0.8)
+)
+
+results <- data.frame()
+set.seed(101)
+
+for (i in 1:nrow(xgb_grid)) {
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = xgb_grid$eta[i],
+    max_depth = xgb_grid$max_depth[i],
+    min_child_weight = xgb_grid$min_child_weight[i],
+    subsample = xgb_grid$subsample[i],
+    colsample_bytree = xgb_grid$colsample_bytree[i],
+    scale_pos_weight = pos_w
+  )
+
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 1000,
+    nfold = 5,
+    early_stopping_rounds = 50,
+    maximize = TRUE,
+    verbose = FALSE
+  )
+
+  results <- rbind(results, data.frame(
+    eta = xgb_grid$eta[i],
+    max_depth = xgb_grid$max_depth[i],
+    min_child_weight = xgb_grid$min_child_weight[i],
+    subsample = xgb_grid$subsample[i],
+    colsample_bytree = xgb_grid$colsample_bytree[i],
+    best_round = cv$best_iteration,
+    best_auc = max(cv$evaluation_log$test_auc_mean)
+  ))
+}
+
+best <- results[which.max(results$best_auc), ]
+cat("\n===== BEST PARAMETERS =====\n")
+print(best)
+
+#--------------------------------------------------
+# 3) Train Final Model
+#--------------------------------------------------
+params_final <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = best$eta,
+  max_depth = best$max_depth,
+  min_child_weight = best$min_child_weight,
+  subsample = best$subsample,
+  colsample_bytree = best$colsample_bytree,
+  scale_pos_weight = pos_w
+)
+
+set.seed(999)
+xgb_best <- xgb.train(
+  params = params_final,
+  data = dtrain,
+  nrounds = best$best_round,
+  verbose = 0
+)
+
+#--------------------------------------------------
+# 4) Predict + Evaluate
+#--------------------------------------------------
+xgb_best_probpred_convert <- predict(xgb_best, newdata = X_test)
+
+# ROC + AUC
+roc_obj <- pROC::roc(response = as.numeric(y_test),
+                     predictor = xgb_best_probpred_convert)
+cat("\nAUC =", round(pROC::auc(roc_obj), 4), "\n")
+
+# Confusion Matrix @ 0.5
+xgb_best_class <- factor(
+  ifelse(xgb_best_probpred_convert >= 0.5, "YES", "NO"),
+  levels = c("NO", "YES")
+)
+
+test_df$boost_chosen_factor <- factor(
+  ifelse(test_df$boost_chosen == 1, "YES", "NO"),
+  levels = c("NO", "YES")
+)
+
+cm_xgb <- caret::confusionMatrix(
+  data = xgb_best_class,
+  reference = test_df$boost_chosen_factor,
+  positive = "YES"
+)
+print(cm_xgb)
+
+#--------------------------------------------------
+# 5) Variable Importance
+#--------------------------------------------------
+xgb_importance <- xgb.importance(model = xgb_best)
+xgb.plot.importance(importance, top_n = 15)
+```
+
+## xgBoost with weights results
+
+```{r}
+#==================================================
+# 4) PREDICT + EVALUATE (Extended Metrics)
+#==================================================
+
+# Predicted probabilities
+xgb_best_probpred_convert <- predict(xgb_best, newdata = X_test)
+
+#--------------------------------------------------
+# ROC Curve + AUC
+#--------------------------------------------------
+library(pROC)
+roc_obj <- roc(response = as.numeric(y_test),
+               predictor = xgb_best_probpred_convert)
+
+auc_val <- auc(roc_obj)
+cat("\nAUC =", round(auc_val, 4), "\n")
+
+# Plot ROC
+plot(roc_obj, col = "blue", lwd = 2, main = "ROC Curve - XGBoost Model")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+#--------------------------------------------------
+# Confusion Matrix @ 0.5 Threshold
+#--------------------------------------------------
+xgb_best_class <- factor(
+  ifelse(xgb_best_probpred_convert >= 0.5, "YES", "NO"),
+  levels = c("NO", "YES")
+)
+
+test_df$boost_chosen_factor <- factor(
+  ifelse(test_df$boost_chosen == 1, "YES", "NO"),
+  levels = c("NO", "YES")
+)
+
+cm_xgb <- caret::confusionMatrix(
+  data = xgb_best_class,
+  reference = test_df$boost_chosen_factor,
+  positive = "YES"
+)
+print(cm_xgb)
+
+#--------------------------------------------------
+# F1 Score
+#--------------------------------------------------
+f1_val <- MLmetrics::F1_Score(
+  y_pred = ifelse(xgb_best_probpred_convert >= 0.5, 1, 0),
+  y_true = y_test
+)
+cat("\nF1 Score =", round(f1_val, 4), "\n")
+
+#--------------------------------------------------
+# Gini Coefficient
+#--------------------------------------------------
+gini_val <- 2 * auc_val - 1
+cat("Gini Coefficient =", round(gini_val, 4), "\n")
+
+#--------------------------------------------------
+# KS Statistic (Kolmogorov–Smirnov)
+#--------------------------------------------------
+pred_df <- data.frame(y_test = y_test, y_pred = xgb_best_probpred_convert)
+pred_df <- pred_df[order(-pred_df$y_pred), ]
+pred_df$cum_pos <- cumsum(pred_df$y_test) / sum(pred_df$y_test)
+pred_df$cum_neg <- cumsum(1 - pred_df$y_test) / sum(1 - pred_df$y_test)
+ks_val <- max(abs(pred_df$cum_pos - pred_df$cum_neg))
+cat("KS Statistic =", round(ks_val, 4), "\n")
+
+# Plot KS Curve
+plot(pred_df$cum_pos, type = "l", col = "blue", lwd = 2, ylim = c(0,1),
+     xlab = "Sample Percentile", ylab = "Cumulative Distribution",
+     main = "KS Curve")
+lines(pred_df$cum_neg, col = "red", lwd = 2)
+legend("topleft", legend = c("Positive", "Negative"),
+       col = c("blue", "red"), lty = 1, bty = "n")
+text(0.6, 0.4, paste0("KS = ", round(ks_val, 3)))
+
+#--------------------------------------------------
+# Lift & Gain Chart (Top Deciles)
+#--------------------------------------------------
+deciles <- quantile(xgb_best_probpred_convert, probs = seq(0, 1, 0.1))
+test_df$decile <- cut(xgb_best_probpred_convert, breaks = deciles, include.lowest = TRUE)
+
+lift_table <- test_df %>%
+  group_by(decile) %>%
+  summarise(
+    total = n(),
+    responders = sum(boost_chosen),
+    response_rate = responders / total
+  ) %>%
+  arrange(desc(decile)) %>%
+  mutate(
+    cumulative_responders = cumsum(responders),
+    cumulative_total = cumsum(total),
+    cumulative_response_rate = cumulative_responders / sum(responders),
+    lift = cumulative_response_rate / (cumulative_total / sum(total))
+  )
+
+print(lift_table)
+
+# Plot Lift Chart
+plot(lift_table$cumulative_total / sum(lift_table$total),
+     lift_table$lift, type = "l", lwd = 2, col = "darkgreen",
+     xlab = "Cumulative % of Sample",
+     ylab = "Lift",
+     main = "Lift Curve")
+abline(h = 1, lty = 2, col = "gray")
+```
+
+# Part 2
+
+medical_cover, gadget_cover
+
+```{r}
+library(gbm)
+library(PRROC)
+library(dplyr)
+
+set.seed(1)
+
+# ===========================
+# 1) Remove convert as predictor
+# ===========================
+train_boost <- train2 %>% select(-convert_numeric)
+test_boost  <- test2  %>% select(-convert_numeric)
+
+# ===========================
+# 2) Use 50% subset for training
+# ===========================
+sub_idx <- sample(nrow(train_boost), size = floor(0.5*nrow(train_boost)))
+train_sub <- train_boost[sub_idx, ]
+
+boost_targets <- c("medical_conditions", "gadget_cover")
+models_list <- list()
+
+# ===========================
+# 3) Fit 1 GBM per boost (NO CV, NO grid)
+# ===========================
+for (tgt in boost_targets) {
+  cat("\n==============================\n")
+  cat(" FITTING (fast) for target:", tgt, "\n")
+  cat("==============================\n")
+  
+  final_mod <- gbm(
+    formula = reformulate(".", response = tgt),
+    distribution = "bernoulli",
+    data = train_sub,
+    n.trees = 1000,
+    interaction.depth = 3,
+    shrinkage = 0.01,
+    n.minobsinnode = 10,
+    bag.fraction = 0.8,
+    train.fraction = 1,
+    verbose = FALSE
+  )
+  
+  models_list[[tgt]] <- final_mod
+}
+
+# ===========================
+# 4) Evaluate AUC on TEST
+# ===========================
+for(tgt in boost_targets){
+  cat("\n---", tgt, " TEST AUC ---\n")
+  
+  prob <- predict(models_list[[tgt]], newdata = test_boost, type = "response")
+  y_true <- test_boost[[tgt]]
+  
+  scores_pos <- prob[y_true == 1]
+  scores_neg <- prob[y_true == 0]
+  
+  auc_val <- roc.curve(scores.class0 = scores_pos,
+                       scores.class1 = scores_neg,
+                       curve = FALSE)$auc
+  print(auc_val)
+}
+```
+
+```{r}
+for(tgt in boost_targets){
+  cat("\nTop 10 features for:", tgt, "\n")
+  print(
+    head(
+      summary(models_list[[tgt]], plotit = FALSE),
+      10
+    )
+  )
+}
+```
+
+### **xgBoost for Part 2**
+
+```{r}
+targets <- c("medical_conditions", "gadget_cover")
+
+models_out <- list()
+
+for (tgt in targets) {
+
+  cat("\n===========================\n")
+  cat("  TRAINING TARGET:", tgt, "\n")
+  cat("===========================\n")
+
+  # --- 1) Create new target column = boost_chosen
+  df_target <- df_modelling %>%
+    mutate(boost_chosen = if_else(.data[[tgt]] == 1, 1, 0))
+
+  # --- 2) Remove all leak columns for this target
+  df_target <- df_target %>%
+    select(-all_of(c("medical_conditions","gadget_cover")))   # <- remove both or remove just the current one?
+
+  # Keep a copy for modelling
+  df_model <- df_target
+
+  # --- 3) Train/Test split
+  set.seed(101)
+  idx <- createDataPartition(df_model$boost_chosen, p = 0.8, list = FALSE)
+  Train <- df_model[idx, ]
+  Test  <- df_model[-idx, ]
+
+  # --- 4) Clean names
+  names(Train) <- make.names(names(Train), unique=TRUE)
+  names(Test)  <- make.names(names(Test),  unique=TRUE)
+
+  # --- 5) Build matrices
+  X_train <- sparse.model.matrix(boost_chosen ~ . - 1, data=Train)
+  y_train <- Train$boost_chosen == 1
+  dtrain  <- xgb.DMatrix(X_train, label=y_train)
+
+  # class weight
+  neg <- sum(y_train==0); pos <- sum(y_train==1)
+  spw <- neg / pos
+
+  # same grid as before
+  grid_xg <- expand.grid(
+    eta              = c(0.05, 0.1),
+    max_depth        = c(6),
+    min_child_weight = c(5, 10),
+    subsample        = c(0.8),
+    colsample_bytree = c(0.8),
+    lambda           = c(1, 3)
+  )
+
+  best <- list(score = -Inf, iter = NA, params = NULL)
+
+  # --- 6) Tuning loop
+  for (i in seq_len(nrow(grid_xg))) {
+    p <- grid_xg[i, ]
+
+    params <- list(
+      objective        = "binary:logistic",
+      eval_metric      = "aucpr",
+      eta              = p$eta,
+      max_depth        = p$max_depth,
+      min_child_weight = p$min_child_weight,
+      subsample        = p$subsample,
+      colsample_bytree = p$colsample_bytree,
+      lambda           = p$lambda,
+      scale_pos_weight = spw
+    )
+
+    cv <- xgb.cv(
+      params = params,
+      data = dtrain,
+      nrounds = 2000,
+      nfold = 5,
+      stratified = TRUE,
+      early_stopping_rounds = 200,
+      verbose = 0
+    )
+
+    score <- cv$evaluation_log$test_aucpr_mean[cv$best_iteration]
+
+    if (!is.na(score) && score > best$score) {
+      best$score  <- score
+      best$iter   <- cv$best_iteration
+      best$params <- params
+    }
+  }
+
+  # store best for this target
+  models_out[[tgt]] <- best
+  cat("Best score for", tgt, "=", best$score, "at", best$iter, "rounds\n")
+}
+```
+
+```{r}
+# ==========================================
+#  FIT FINAL MODELS + VARIABLE IMPORTANCE
+# ==========================================
+
+final_models <- list()
+
+for (tgt in targets) {
+
+  cat("\n===========================\n")
+  cat("  FITTING FINAL MODEL FOR:", tgt, "\n")
+  cat("===========================\n")
+
+  # --- Recreate training data for THIS target exactly as above (same steps)
+
+  df_target <- df_modelling %>%
+    mutate(boost_chosen = if_else(.data[[tgt]] == 1, 1, 0)) %>%
+    # << IMPORTANT: remove only current target — keep the other as predictor >>
+    select(-all_of(tgt))
+
+  set.seed(101)
+  idx  <- createDataPartition(df_target$boost_chosen, p=0.8, list=FALSE)
+  Train <- df_target[idx, ]
+  Test  <- df_target[-idx, ]
+
+  names(Train) <- make.names(names(Train), unique = TRUE)
+
+  X_train <- sparse.model.matrix(boost_chosen ~ . - 1, data=Train)
+  y_train <- Train$boost_chosen == 1
+  dtrain  <- xgb.DMatrix(X_train, label = y_train)
+
+  best_par  <- models_out[[tgt]]$params
+  best_n    <- models_out[[tgt]]$iter
+
+  final_mod <- xgb.train(
+    params  = best_par,
+    data    = dtrain,
+    nrounds = best_n,
+    verbose = 0
+  )
+
+  final_models[[tgt]] <- list(
+    model = final_mod,
+    train_cols = colnames(X_train)
+  )
+
+  # ---------- variable importance ----------
+  cat("\nTop 10 predictors for:", tgt, "\n")
+  imp <- xgb.importance(
+    feature_names = colnames(X_train),
+    model = final_mod
+  )
+  print(head(imp, 10))
+}
+```
+
+## Part 2 with weights
+
+insert a column with random numbers - unif distribution generator
+
+plot pdps for truly significant ones
+
+weights stuff from gbm and xgboosts
+
+main results
+
+pdps for part 1
+
+part 2 models
+
+-   weights
+
+-   pdp stuff
+
+-   shap clustering
+
+## Part 1 - Results for Report
